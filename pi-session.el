@@ -378,6 +378,19 @@ CALLBACK receives `(SESSION RESPONSE)'."
         (when callback
           (funcall callback session response)))))))
 
+(defun pi-session-get-commands (session callback)
+  "Load available slash commands for SESSION and invoke CALLBACK.
+CALLBACK receives `(SESSION RESPONSE)'."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      '(("type" . "get_commands"))
+      (lambda (response)
+        (when callback
+          (funcall callback session response)))))))
+
 (defun pi-session-restart (session)
   "Restart SESSION process and preserve session context."
   (unless session

@@ -16,6 +16,7 @@
 
 (declare-function pi-ui-open-session "pi-ui" (&optional source-buffer))
 (declare-function pi-ui-send-prompt "pi-ui" (source-buffer prompt))
+(declare-function pi-ui-compose-prompt "pi-ui" (&optional source-buffer initial-text))
 
 (defgroup pi nil
   "Emacs integration for pi."
@@ -34,10 +35,10 @@
   (interactive)
   (pi-ui-open-session (current-buffer)))
 
-(defun pi-prompt (prompt)
-  "Send PROMPT to the current buffer scope session."
-  (interactive (list (read-string "Pi prompt: ")))
-  (pi-ui-send-prompt (current-buffer) prompt))
+(defun pi-prompt ()
+  "Compose and send a prompt to the current buffer scope session."
+  (interactive)
+  (pi-ui-compose-prompt (current-buffer)))
 
 (provide 'pi)
 
