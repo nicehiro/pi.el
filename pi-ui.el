@@ -361,24 +361,22 @@ Lower values feel more immediate but may increase UI load."
                (if duration (concat " " duration) "")
                "\n\n")))))
 
-(defun pi-ui--section-label (text face)
-  (concat
-   (propertize "────────────────────────────────────────\n" 'face 'pi-ui-meta-face)
-   (propertize text 'face face)
-   "\n"
-   (propertize "────────────────────────────────────────\n\n" 'face 'pi-ui-meta-face)))
+(defun pi-ui--section-label (text face &optional level)
+  (let ((level (max 1 (or level 3))))
+    (propertize (format "%s %s\n\n" (make-string level ?#) text)
+                'face face)))
 
 (defun pi-ui--render-message (message)
   (pcase (plist-get message :role)
     ("user"
-     (concat (pi-ui--section-label "User" 'pi-ui-user-heading-face)
+     (concat (pi-ui--section-label "User" 'pi-ui-user-heading-face 2)
              (pi-ui--extract-user-content message)
              "\n\n"))
     ("assistant"
      (let ((content (pi-ui--extract-assistant-content message)))
        (if (string-empty-p content)
            ""
-         (concat (pi-ui--section-label "Assistant" 'pi-ui-assistant-heading-face)
+         (concat (pi-ui--section-label "Assistant" 'pi-ui-assistant-heading-face 2)
                  content
                  "\n\n"))))
     ("toolResult"
