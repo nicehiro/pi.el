@@ -391,6 +391,87 @@ CALLBACK receives `(SESSION RESPONSE)'."
         (when callback
           (funcall callback session response)))))))
 
+(defun pi-session-new-session (session &optional callback)
+  "Start a fresh session in SESSION scope."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      '(("type" . "new_session"))
+      (lambda (response)
+        (when callback
+          (funcall callback session response)))))))
+
+(defun pi-session-compact (session &optional custom-instructions callback)
+  "Compact SESSION context with optional CUSTOM-INSTRUCTIONS."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (let ((command (append '(("type" . "compact"))
+                            (when (and (stringp custom-instructions)
+                                       (not (string-empty-p custom-instructions)))
+                              `(("customInstructions" . ,custom-instructions))))))
+       (pi-rpc-send
+        (pi-session-rpc session)
+        command
+        (lambda (response)
+          (when callback
+            (funcall callback session response))))))))
+
+(defun pi-session-export-html (session &optional output-path callback)
+  "Export SESSION to HTML, optionally writing to OUTPUT-PATH."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (let ((command (append '(("type" . "export_html"))
+                            (when (and (stringp output-path)
+                                       (not (string-empty-p output-path)))
+                              `(("outputPath" . ,output-path))))))
+       (pi-rpc-send
+        (pi-session-rpc session)
+        command
+        (lambda (response)
+          (when callback
+            (funcall callback session response))))))))
+
+(defun pi-session-cycle-model (session &optional callback)
+  "Cycle to the next model in SESSION."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      '(("type" . "cycle_model"))
+      (lambda (response)
+        (when callback
+          (funcall callback session response)))))))
+
+(defun pi-session-set-thinking-level (session level &optional callback)
+  "Set SESSION reasoning LEVEL."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      `(("type" . "set_thinking_level")
+        ("level" . ,level))
+      (lambda (response)
+        (when callback
+          (funcall callback session response)))))))
+
+(defun pi-session-cycle-thinking-level (session &optional callback)
+  "Cycle to the next reasoning level for SESSION."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      '(("type" . "cycle_thinking_level"))
+      (lambda (response)
+        (when callback
+          (funcall callback session response)))))))
+
 (defun pi-session-restart (session)
   "Restart SESSION process and preserve session context."
   (unless session
