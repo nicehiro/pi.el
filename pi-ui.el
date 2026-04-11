@@ -57,6 +57,12 @@ to the latest output during updates."
   "Whether to render incremental assistant deltas while a run is active."
   :type 'boolean)
 
+(defcustom pi-ui-stream-render-interval 0.05
+  "Seconds between live-stream redraws.
+
+Lower values feel more immediate but may increase UI load."
+  :type 'number)
+
 (defface pi-ui-session-title-face
   '((t :inherit font-lock-keyword-face :weight bold :height 1.1))
   "Face for session buffer titles."
@@ -115,6 +121,7 @@ to the latest output during updates."
 (defvar-local pi-ui--live-message nil)
 (defvar-local pi-ui--transient-items nil)
 (defvar-local pi-ui--loading nil)
+(defvar-local pi-ui--pending-render-timer nil)
 
 (defvar pi-session-buffer-mode-map
   (let ((map (make-sparse-keymap)))
@@ -144,7 +151,13 @@ to the latest output during updates."
     map)
   "Keymap for `pi-session-buffer-mode'.")
 
+(defun pi-ui--cancel-pending-render ()
+  (when (timerp pi-ui--pending-render-timer)
+    (cancel-timer pi-ui--pending-render-timer))
+  (setq-local pi-ui--pending-render-timer nil))
+
 (defun pi-ui--session-buffer-killed ()
+  (pi-ui--cancel-pending-render)
   (when pi-ui--session
     (let ((current (gethash (pi-session-id pi-ui--session) pi-ui--session-buffers)))
       (when (eq current (current-buffer))
@@ -161,6 +174,7 @@ to the latest output during updates."
       (setq-local pi-ui--live-message nil)
       (setq-local pi-ui--transient-items nil)
       (setq-local pi-ui--loading nil)
+      (setq-local pi-ui--pending-render-timer nil)
       (add-hook 'kill-buffer-hook #'pi-ui--session-buffer-killed nil t))
   (define-derived-mode pi-session-buffer-mode special-mode "Pi-Session"
     "Major mode for pi session buffers."
@@ -171,6 +185,7 @@ to the latest output during updates."
     (setq-local pi-ui--live-message nil)
     (setq-local pi-ui--transient-items nil)
     (setq-local pi-ui--loading nil)
+    (setq-local pi-ui--pending-render-timer nil)
     (add-hook 'kill-buffer-hook #'pi-ui--session-buffer-killed nil t)))
 
 (defun pi-ui--session-buffer-name (session)
@@ -178,6 +193,11 @@ to the latest output during updates."
 
 (defun pi-ui--get-buffer (session)
   (gethash (pi-session-id session) pi-ui--session-buffers))
+
+(defun pi-ui--session-visible-p (session)
+  (when-let* ((buffer (pi-ui--get-buffer session)))
+    (and (buffer-live-p buffer)
+         (get-buffer-window buffer t))))
 
 (defun pi-ui--register-buffer (session buffer)
   (puthash (pi-session-id session) buffer pi-ui--session-buffers)
@@ -351,15 +371,14 @@ to the latest output during updates."
 (defun pi-ui--render-message (message)
   (pcase (plist-get message :role)
     ("user"
-     (concat (propertize "────────────────────────────────────────\n" 'face 'pi-ui-meta-face)
-             (propertize "### User\n\n" 'face 'pi-ui-user-heading-face)
+     (concat (pi-ui--section-label "User" 'pi-ui-user-heading-face)
              (pi-ui--extract-user-content message)
              "\n\n"))
     ("assistant"
      (let ((content (pi-ui--extract-assistant-content message)))
        (if (string-empty-p content)
            ""
-         (concat (propertize "### Assistant\n\n" 'face 'pi-ui-assistant-heading-face)
+         (concat (pi-ui--section-label "Assistant" 'pi-ui-assistant-heading-face)
                  content
                  "\n\n"))))
     ("toolResult"
@@ -408,6 +427,25 @@ to the latest output during updates."
                           (goto-char (point-max))
                           (line-beginning-position))
                         t))))
+
+(defun pi-ui--schedule-render (buffer &optional force)
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (if force
+          (progn
+            (pi-ui--cancel-pending-render)
+            (pi-ui--buffer-render buffer))
+        (unless (timerp pi-ui--pending-render-timer)
+          (setq-local
+           pi-ui--pending-render-timer
+           (run-at-time
+            pi-ui-stream-render-interval nil
+            (lambda (buf)
+              (when (buffer-live-p buf)
+                (with-current-buffer buf
+                  (setq-local pi-ui--pending-render-timer nil))
+                (pi-ui--buffer-render buf)))
+            buffer)))))))
 
 (defun pi-ui--buffer-render (buffer)
   (with-current-buffer buffer
@@ -603,25 +641,27 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
          (when (equal (pi-ui--event-message-role event) "assistant")
            (with-current-buffer buffer
              (setq-local pi-ui--live-message (plist-get event :message)))
-           (pi-ui--buffer-render buffer)))
+           (pi-ui--schedule-render buffer t)))
         ("message_update"
          (let ((message (plist-get event :message)))
            (when (and message (equal (plist-get message :role) "assistant"))
              (with-current-buffer buffer
                (setq-local pi-ui--live-message message))
-             (pi-ui--buffer-render buffer))))
+             (if pi-ui-enable-streaming
+                 (pi-ui--schedule-render buffer)
+               (pi-ui--schedule-render buffer t)))))
         ((or "message_delta" "content_delta" "assistant_delta" "text_delta")
          (when (and pi-ui-enable-streaming (pi-ui--assistant-event-p event))
            (when-let* ((delta (pi-ui--event-text-delta event)))
              (pi-ui--append-live-delta buffer delta)
-             (pi-ui--buffer-render buffer))))
+             (pi-ui--schedule-render buffer))))
         ("message_end"
          (let ((message (plist-get event :message)))
            (pcase (plist-get message :role)
              ("assistant"
               (with-current-buffer buffer
                 (setq-local pi-ui--live-message message))
-              (pi-ui--buffer-render buffer))
+              (pi-ui--schedule-render buffer t))
              ("user"
               (pi-ui--append-history-message buffer message))
              ("toolResult" nil))))
@@ -703,6 +743,9 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
                           (lambda (_session response)
                             (when (eq (plist-get response :success) :json-false)
                               (message "pi: %s" (plist-get response :error))))))
+
+(unless pi-session-keepalive-predicate
+  (setq pi-session-keepalive-predicate #'pi-ui--session-visible-p))
 
 (add-hook 'pi-session-event-hook #'pi-ui--handle-session-event)
 
