@@ -205,6 +205,36 @@ Lower values feel more immediate but may increase UI load."
     map)
   "Keymap for `pi-session-buffer-mode'.")
 
+(defun pi-ui--session-model-name (session)
+  (when-let* ((state (and session (pi-session-cached-state session)))
+              (model (plist-get state :model)))
+    (or (plist-get model :name)
+        (let ((provider (plist-get model :provider))
+              (id (plist-get model :id)))
+          (cond
+           ((and provider id) (format "%s/%s" provider id))
+           (id id))))))
+
+(defun pi-ui--session-header-line (session)
+  (when session
+    (let ((items nil))
+      (when-let* ((model-name (pi-ui--session-model-name session)))
+        (push (format "Model: %s" model-name) items))
+      (when-let* ((thinking-level (plist-get (pi-session-cached-state session)
+                                             :thinking-level)))
+        (push (format "Thinking: %s" thinking-level) items))
+      (when items
+        (propertize (string-join (nreverse items) " • ")
+                    'face 'pi-ui-meta-face)))))
+
+(defun pi-ui--update-session-header-line (&optional buffer)
+  (with-current-buffer (or buffer (current-buffer))
+    (setq-local header-line-format
+                '(:eval
+                  (and (boundp 'pi-ui--session)
+                       (pi-ui--session-header-line pi-ui--session))))
+    (force-mode-line-update t)))
+
 (defun pi-ui--prompt-source-root (source-buffer)
   (or (and (buffer-live-p source-buffer)
            (plist-get (pi-session-scope-for-buffer source-buffer) :root))
@@ -498,6 +528,7 @@ INITIAL-TEXT pre-fills the prompt buffer."
       (setq-local pi-ui--transient-items nil)
       (setq-local pi-ui--loading nil)
       (setq-local pi-ui--pending-render-timer nil)
+      (setq-local header-line-format nil)
       (add-hook 'kill-buffer-hook #'pi-ui--session-buffer-killed nil t))
   (define-derived-mode pi-session-buffer-mode special-mode "Pi-Session"
     "Major mode for pi session buffers."
@@ -509,6 +540,7 @@ INITIAL-TEXT pre-fills the prompt buffer."
     (setq-local pi-ui--transient-items nil)
     (setq-local pi-ui--loading nil)
     (setq-local pi-ui--pending-render-timer nil)
+    (setq-local header-line-format nil)
     (add-hook 'kill-buffer-hook #'pi-ui--session-buffer-killed nil t)))
 
 (defun pi-ui--session-buffer-name (session)
@@ -950,6 +982,7 @@ INITIAL-TEXT pre-fills the prompt buffer."
                                           (cons win (pi-ui--window-at-bottom-p win)))
                                         windows))))
       (pi-ui--rebuild-tool-call-summary-index history live)
+      (pi-ui--update-session-header-line buffer)
       (erase-buffer)
       (insert (propertize (format "pi session: %s\n" (pi-session-name session))
                           'face 'pi-ui-session-title-face))

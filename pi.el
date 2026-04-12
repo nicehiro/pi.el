@@ -13,6 +13,7 @@
 (require 'pi-rpc)
 (require 'pi-session)
 (require 'pi-ui)
+(require 'seq)
 (require 'subr-x)
 
 (declare-function pi-ui-open-session "pi-ui" (&optional source-buffer))
@@ -21,8 +22,10 @@
 (declare-function pi-ui-compose-prompt "pi-ui" (&optional source-buffer initial-text))
 
 (declare-function pi-session-new-session "pi-session" (session &optional callback))
+(declare-function pi-session-get-available-models "pi-session" (session callback))
 (declare-function pi-session-compact "pi-session" (session &optional custom-instructions callback))
 (declare-function pi-session-export-html "pi-session" (session &optional output-path callback))
+(declare-function pi-session-set-model "pi-session" (session provider model-id &optional callback))
 (declare-function pi-session-cycle-model "pi-session" (session &optional callback))
 (declare-function pi-session-set-thinking-level "pi-session" (session level &optional callback))
 (declare-function pi-session-cycle-thinking-level "pi-session" (session &optional callback))
@@ -45,12 +48,15 @@
     (define-key map (kbd "a") #'pi-abort)
     (define-key map (kbd "e") #'pi-export-session-html)
     (define-key map (kbd "m") #'pi-cycle-model)
+    (define-key map (kbd "s") #'pi-set-model)
     (define-key map (kbd "t") #'pi-cycle-thinking-level)
     (define-key map (kbd "T") #'pi-set-thinking-level)
     (define-key map (kbd "r") #'pi-reload-session)
     (define-key map (kbd "l") #'pi-list-sessions)
     map)
   "Prefix keymap for pi commands.")
+
+(define-key pi-command-map (kbd "s") #'pi-set-model)
 
 (defun pi-open ()
   "Open and focus the current buffer scope session."
@@ -64,6 +70,26 @@
   (let ((session (pi-session-ensure-for-buffer source-buffer)))
     (pi-ui-show-session-buffer session source-buffer)
     session))
+
+(defun pi--model-ref (model)
+  (when model
+    (let ((provider (plist-get model :provider))
+          (id (plist-get model :id)))
+      (cond
+       ((and provider id) (format "%s/%s" provider id))
+       (id id)))))
+
+(defun pi--model-name (model)
+  (or (and model (plist-get model :name))
+      (pi--model-ref model)
+      "unknown model"))
+
+(defun pi--model-candidate (model)
+  (let ((name (pi--model-name model))
+        (ref (pi--model-ref model)))
+    (if (and ref (not (string= name ref)))
+        (format "%s — %s" name ref)
+      name)))
 
 (defun pi-prompt ()
   "Compose and send a prompt to the current buffer scope session."
@@ -141,14 +167,55 @@ If PATH is empty, let pi choose the output path."
      (lambda (_s response)
        (if (pi--rpc-success-p response)
            (let* ((data (plist-get response :data))
-                  (model (and data (plist-get data :model)))
-                  (name (or (and model (plist-get model :name))
-                            (and model (plist-get model :id)))))
-             (message "%s" (if name
-                                (format "pi: switched model to %s" name)
+                  (model (and data (plist-get data :model))))
+             (message "%s" (if model
+                                (format "pi: switched model to %s" (pi--model-name model))
                               "pi: model unchanged")))
          (message "pi: %s" (or (plist-get response :error)
                                "Failed to cycle model")))))))
+
+(defun pi-set-model ()
+  "Select a configured model for the current session."
+  (interactive)
+  (let* ((source-buffer (current-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-get-available-models
+     session
+     (lambda (s response)
+       (if (not (pi--rpc-success-p response))
+           (message "pi: %s" (or (plist-get response :error)
+                                 "Failed to load models"))
+         (let* ((models (plist-get (plist-get response :data) :models))
+                (choices (mapcar (lambda (model)
+                                   (cons (pi--model-candidate model) model))
+                                 models))
+                (current-model (plist-get (pi-session-cached-state s) :model))
+                (current-ref (pi--model-ref current-model))
+                (default (car (seq-find (lambda (entry)
+                                          (equal (pi--model-ref (cdr entry)) current-ref))
+                                        choices))))
+           (if (null choices)
+               (message "pi: no configured models available")
+             (let* ((selection (completing-read
+                                (if current-model
+                                    (format "Model (current %s): "
+                                            (pi--model-name current-model))
+                                  "Model: ")
+                                (mapcar #'car choices)
+                                nil t nil nil default))
+                    (model (cdr (assoc selection choices))))
+               (when model
+                 (pi-session-set-model
+                  s
+                  (plist-get model :provider)
+                  (plist-get model :id)
+                  (lambda (_s2 set-response)
+                    (if (pi--rpc-success-p set-response)
+                        (message "pi: switched model to %s"
+                                 (pi--model-name (or (plist-get set-response :data)
+                                                     model)))
+                      (message "pi: %s" (or (plist-get set-response :error)
+                                            "Failed to set model"))))))))))))))
 
 (defun pi-cycle-thinking-level ()
   "Cycle to the next thinking level for the current session."

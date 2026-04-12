@@ -166,10 +166,17 @@ The plist keys are :kind, :root, :name, and :key."
 
 (defun pi-session--state-from-response (response)
   (let ((data (plist-get response :data)))
-    (list :is-streaming (plist-get data :isStreaming)
+    (list :model (plist-get data :model)
+          :thinking-level (plist-get data :thinkingLevel)
+          :is-streaming (plist-get data :isStreaming)
+          :is-compacting (plist-get data :isCompacting)
+          :steering-mode (plist-get data :steeringMode)
+          :follow-up-mode (plist-get data :followUpMode)
           :session-file (plist-get data :sessionFile)
           :session-id (plist-get data :sessionId)
           :session-name (plist-get data :sessionName)
+          :auto-compaction-enabled (plist-get data :autoCompactionEnabled)
+          :message-count (plist-get data :messageCount)
           :pending-message-count (plist-get data :pendingMessageCount)
           :last-refresh-at (float-time))))
 
@@ -403,6 +410,19 @@ CALLBACK receives `(SESSION RESPONSE)'."
         (when callback
           (funcall callback session response)))))))
 
+(defun pi-session-get-available-models (session callback)
+  "Load configured models for SESSION and invoke CALLBACK.
+CALLBACK receives `(SESSION RESPONSE)'."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      '(("type" . "get_available_models"))
+      (lambda (response)
+        (when callback
+          (funcall callback session response)))))))
+
 (defun pi-session-compact (session &optional custom-instructions callback)
   "Compact SESSION context with optional CUSTOM-INSTRUCTIONS."
   (pi-session--ensure-running
@@ -435,6 +455,26 @@ CALLBACK receives `(SESSION RESPONSE)'."
           (when callback
             (funcall callback session response))))))))
 
+(defun pi-session-set-model (session provider model-id &optional callback)
+  "Switch SESSION to PROVIDER/MODEL-ID."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      `(("type" . "set_model")
+        ("provider" . ,provider)
+        ("modelId" . ,model-id))
+      (lambda (response)
+        (if (eq (plist-get response :success) :json-false)
+            (when callback
+              (funcall callback session response))
+          (pi-session--request-state
+           session
+           (lambda (_s _state _state-response)
+             (when callback
+               (funcall callback session response))))))))))
+
 (defun pi-session-cycle-model (session &optional callback)
   "Cycle to the next model in SESSION."
   (pi-session--ensure-running
@@ -444,6 +484,19 @@ CALLBACK receives `(SESSION RESPONSE)'."
       (pi-session-rpc session)
       '(("type" . "cycle_model"))
       (lambda (response)
+        (unless (eq (plist-get response :success) :json-false)
+          (when-let* ((data (plist-get response :data))
+                      (model (plist-get data :model)))
+            (setf (pi-session-cached-state session)
+                  (plist-put (pi-session-cached-state session)
+                             :model
+                             model)))
+          (when-let* ((data (plist-get response :data))
+                      (thinking-level (plist-get data :thinkingLevel)))
+            (setf (pi-session-cached-state session)
+                  (plist-put (pi-session-cached-state session)
+                             :thinking-level
+                             thinking-level))))
         (when callback
           (funcall callback session response)))))))
 
@@ -457,8 +510,14 @@ CALLBACK receives `(SESSION RESPONSE)'."
       `(("type" . "set_thinking_level")
         ("level" . ,level))
       (lambda (response)
-        (when callback
-          (funcall callback session response)))))))
+        (if (eq (plist-get response :success) :json-false)
+            (when callback
+              (funcall callback session response))
+          (pi-session--request-state
+           session
+           (lambda (_s _state _state-response)
+             (when callback
+               (funcall callback session response))))))))))
 
 (defun pi-session-cycle-thinking-level (session &optional callback)
   "Cycle to the next reasoning level for SESSION."
@@ -469,6 +528,13 @@ CALLBACK receives `(SESSION RESPONSE)'."
       (pi-session-rpc session)
       '(("type" . "cycle_thinking_level"))
       (lambda (response)
+        (unless (eq (plist-get response :success) :json-false)
+          (when-let* ((data (plist-get response :data))
+                      (level (plist-get data :level)))
+            (setf (pi-session-cached-state session)
+                  (plist-put (pi-session-cached-state session)
+                             :thinking-level
+                             level))))
         (when callback
           (funcall callback session response)))))))
 
