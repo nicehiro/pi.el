@@ -149,6 +149,7 @@ Lower values feel more immediate but may increase UI load."
 (defvar-local pi-ui--transient-items nil)
 (defvar-local pi-ui--loading nil)
 (defvar-local pi-ui--pending-render-timer nil)
+(defvar-local pi-ui--tool-call-summary-by-id nil)
 
 (defvar-local pi-ui--prompt-source-buffer nil)
 (defvar-local pi-ui--prompt-source-window nil)
@@ -596,6 +597,156 @@ INITIAL-TEXT pre-fills the prompt buffer."
       (concat (string-join (seq-take lines max-lines) "\n")
               (format "\n... [%d more lines hidden]" (- count max-lines))))))
 
+(defun pi-ui--truncate-inline (text max-length)
+  (let* ((flat (replace-regexp-in-string "[\n\r\t]+" " " (or text "")))
+         (trimmed (string-trim flat)))
+    (if (> (length trimmed) max-length)
+        (concat (substring trimmed 0 (max 0 (1- max-length))) "…")
+      trimmed)))
+
+(defun pi-ui--tool-arg-value (args key)
+  (let* ((name (if (symbolp key) (symbol-name key) key))
+         (plain (if (string-prefix-p ":" name) (substring name 1) name))
+         (kw (intern (concat ":" plain)))
+         (sym (intern plain)))
+    (cond
+     ((hash-table-p args)
+      (or (gethash kw args)
+          (gethash sym args)
+          (gethash plain args)))
+     ((listp args)
+      (or (plist-get args kw)
+          (plist-get args sym)
+          (cdr (assq kw args))
+          (cdr (assq sym args))
+          (cdr (assoc plain args))))
+     (t nil))))
+
+(defun pi-ui--normalize-tool-arguments (value)
+  (cond
+   ((or (null value) (listp value) (hash-table-p value)) value)
+   ((stringp value)
+    (condition-case nil
+        (let ((json-object-type 'plist)
+              (json-array-type 'list)
+              (json-false :json-false)
+              (json-null nil))
+          (json-parse-string value :object-type 'plist :array-type 'list
+                             :false-object :json-false :null-object nil))
+      (error nil)))
+   (t nil)))
+
+(defun pi-ui--tool-arguments-from-object (object)
+  (pi-ui--normalize-tool-arguments
+   (or (plist-get object :arguments)
+       (plist-get object :input)
+       (plist-get object :params)
+       (plist-get object :parameters)
+       (plist-get object :toolArguments)
+       (plist-get object :toolInput))))
+
+(defun pi-ui--display-tool-path (path)
+  (when (and (stringp path) (not (string-empty-p path)))
+    (let* ((root (and pi-ui--session
+                      (pi-session-root pi-ui--session)
+                      (file-name-as-directory
+                       (expand-file-name (pi-session-root pi-ui--session)))))
+           (rendered
+            (if root
+                (let ((expanded (expand-file-name path root)))
+                  (if (string-prefix-p root expanded)
+                      (file-relative-name expanded root)
+                    (abbreviate-file-name expanded)))
+              (if (file-name-absolute-p path)
+                  (abbreviate-file-name path)
+                path))))
+      (pi-ui--truncate-inline rendered 90))))
+
+(defun pi-ui--tool-detail-from-arguments (tool-name args)
+  (let* ((tool (and (stringp tool-name) (downcase tool-name)))
+         (args (pi-ui--normalize-tool-arguments args))
+         (detail
+          (pcase tool
+            ((or "read" "write" "edit")
+             (pi-ui--display-tool-path (pi-ui--tool-arg-value args "path")))
+            ("bash"
+             (when-let* ((command (pi-ui--tool-arg-value args "command")))
+               (concat "$ " (pi-ui--truncate-inline command 70))))
+            ("arxiv_paper"
+             (pi-ui--truncate-inline (or (pi-ui--tool-arg-value args "id") "") 60))
+            ("arxiv_search"
+             (pi-ui--truncate-inline (or (pi-ui--tool-arg-value args "query") "") 60))
+            ("zotero"
+             (let ((action (pi-ui--tool-arg-value args "action"))
+                   (query (pi-ui--tool-arg-value args "query")))
+               (cond
+                ((and action query)
+                 (pi-ui--truncate-inline (format "%s: %s" action query) 60))
+                (action (format "%s" action))
+                (query (pi-ui--truncate-inline query 60))
+                (t nil))))
+            ("zotero_web"
+             (let ((action (pi-ui--tool-arg-value args "action"))
+                   (query (pi-ui--tool-arg-value args "query")))
+               (cond
+                ((and action query)
+                 (pi-ui--truncate-inline (format "%s: %s" action query) 60))
+                (action (format "%s" action))
+                (query (pi-ui--truncate-inline query 60))
+                (t nil))))
+            (_
+             (or (pi-ui--display-tool-path (pi-ui--tool-arg-value args "path"))
+                 (when-let* ((query (pi-ui--tool-arg-value args "query")))
+                   (pi-ui--truncate-inline query 60))
+                 (when-let* ((id (pi-ui--tool-arg-value args "id")))
+                   (pi-ui--truncate-inline (format "%s" id) 60))
+                 (when-let* ((command (pi-ui--tool-arg-value args "command")))
+                   (concat "$ " (pi-ui--truncate-inline command 60))))))))
+    (and (stringp detail) (not (string-empty-p detail)) detail)))
+
+(defun pi-ui--rebuild-tool-call-summary-index (history live)
+  (let ((table (make-hash-table :test #'equal)))
+    (cl-labels
+        ((collect (message)
+           (when (and (listp message)
+                      (equal (plist-get message :role) "assistant"))
+             (dolist (block (plist-get message :content))
+               (when (and (listp block)
+                          (equal (plist-get block :type) "toolCall"))
+                 (let* ((tool-call-id (or (plist-get block :id)
+                                          (plist-get block :toolCallId)))
+                        (tool-name (or (plist-get block :name)
+                                       (plist-get block :toolName)))
+                        (args (pi-ui--tool-arguments-from-object block))
+                        (detail (pi-ui--tool-detail-from-arguments tool-name args)))
+                   (when (and (stringp tool-call-id)
+                              (not (string-empty-p tool-call-id))
+                              detail)
+                     (puthash tool-call-id detail table))))))))
+      (dolist (message history)
+        (collect message))
+      (collect live))
+    (setq-local pi-ui--tool-call-summary-by-id table)))
+
+(defun pi-ui--tool-detail-for-call-id (tool-call-id)
+  (when (and (stringp tool-call-id)
+             (hash-table-p pi-ui--tool-call-summary-by-id)
+             (not (string-empty-p tool-call-id)))
+    (gethash tool-call-id pi-ui--tool-call-summary-by-id)))
+
+(defun pi-ui--tool-detail-from-message (message)
+  (or (pi-ui--tool-detail-from-arguments
+       (plist-get message :toolName)
+       (pi-ui--tool-arguments-from-object message))
+      (pi-ui--tool-detail-for-call-id (plist-get message :toolCallId))))
+
+(defun pi-ui--tool-detail-from-item (item)
+  (or (plist-get item :detail)
+      (pi-ui--tool-detail-from-arguments
+       (plist-get item :tool-name)
+       (plist-get item :arguments))
+      (pi-ui--tool-detail-for-call-id (plist-get item :tool-call-id))))
+
 (defun pi-ui--extract-tool-result-content (message)
   (let ((content (plist-get message :content)))
     (if (listp content)
@@ -646,24 +797,25 @@ INITIAL-TEXT pre-fills the prompt buffer."
     ('error 'pi-ui-tool-error-face)
     (_ 'pi-ui-tool-line-face)))
 
-(defun pi-ui--render-tool-result (tool-name &optional text status duration-ms)
+(defun pi-ui--render-tool-result (tool-name &optional text status duration-ms detail)
   (pcase pi-ui-tool-display-style
     ('hidden "")
     ('verbose
-     (let ((suffix (string-join
-                    (delq nil
-                          (list
-                           (pcase status
-                             ('success "✓")
-                             ('error "✗")
-                             (_ nil))
-                           (when-let* ((duration (pi-ui--format-duration-ms duration-ms)))
-                             (format "(%s)" duration))))
-                    " ")))
+     (let* ((label (string-join (delq nil (list (or tool-name "tool") detail)) " · "))
+            (suffix (string-join
+                     (delq nil
+                           (list
+                            (pcase status
+                              ('success "✓")
+                              ('error "✗")
+                              (_ nil))
+                            (when-let* ((duration (pi-ui--format-duration-ms duration-ms)))
+                              (format "(%s)" duration))))
+                     " ")))
        (concat (pi-ui--section-label
                 (string-trim
                  (format "Tool Result · %s %s"
-                         (or tool-name "tool")
+                         label
                          suffix))
                 'pi-ui-tool-heading-face)
                "```text\n"
@@ -671,6 +823,9 @@ INITIAL-TEXT pre-fills the prompt buffer."
                "\n```\n\n")))
     (_
      (let* ((tool (or tool-name "tool"))
+            (detail-text (and (stringp detail)
+                              (not (string-empty-p detail))
+                              (propertize (concat " · " detail) 'face 'pi-ui-tool-line-face)))
             (status-mark (pcase status
                            ('success (propertize "✓" 'face 'pi-ui-tool-success-face))
                            ('error (propertize "✗" 'face 'pi-ui-tool-error-face))
@@ -679,9 +834,10 @@ INITIAL-TEXT pre-fills the prompt buffer."
                         (propertize (format "(%s)" formatted) 'face 'pi-ui-tool-line-face))))
        (concat (propertize "Tool · " 'face 'pi-ui-tool-prefix-face)
                (propertize tool 'face (pi-ui--tool-summary-face status))
+               (or detail-text "")
                (if status-mark (concat " " status-mark) "")
                (if duration (concat " " duration) "")
-               "\n\n")))))
+               "\n")))))
 
 (defun pi-ui--section-label (text face &optional level)
   (let ((level (max 1 (or level 3))))
@@ -705,7 +861,9 @@ INITIAL-TEXT pre-fills the prompt buffer."
      (pi-ui--render-tool-result
       (plist-get message :toolName)
       (pi-ui--extract-tool-result-content message)
-      (pi-ui--tool-status-from-message message)))
+      (pi-ui--tool-status-from-message message)
+      nil
+      (pi-ui--tool-detail-from-message message)))
     ("custom"
      (concat (pi-ui--section-label "Custom" 'pi-ui-meta-face)
              (or (pi-ui--extract-user-content message) "")
@@ -731,7 +889,8 @@ INITIAL-TEXT pre-fills the prompt buffer."
       (plist-get item :tool-name)
       (or (plist-get item :text) "")
       (plist-get item :status)
-      (plist-get item :duration-ms)))
+      (plist-get item :duration-ms)
+      (pi-ui--tool-detail-from-item item)))
     (_ "")))
 
 (defun pi-ui--window-at-bottom-p (window)
@@ -779,6 +938,7 @@ INITIAL-TEXT pre-fills the prompt buffer."
                                 (mapcar (lambda (win)
                                           (cons win (pi-ui--window-at-bottom-p win)))
                                         windows))))
+      (pi-ui--rebuild-tool-call-summary-index history live)
       (erase-buffer)
       (insert (propertize (format "pi session: %s\n" (pi-session-name session))
                           'face 'pi-ui-session-title-face))
@@ -788,12 +948,23 @@ INITIAL-TEXT pre-fills the prompt buffer."
                           'face 'pi-ui-meta-face))
       (when pi-ui--loading
         (insert (propertize "loading session messages...\n\n" 'face 'pi-ui-placeholder-face)))
-      (dolist (message history)
-        (insert (pi-ui--render-message message)))
-      (dolist (item transients)
-        (insert (pi-ui--render-transient-item item)))
-      (when live
-        (insert (pi-ui--render-message live)))
+      (let ((prev-tool-line nil))
+        (cl-labels
+            ((insert-entry (text is-tool)
+               (unless (string-empty-p text)
+                 (when (and prev-tool-line (not is-tool))
+                   (insert "\n"))
+                 (insert text)
+                 (setq prev-tool-line is-tool))))
+          (dolist (message history)
+            (insert-entry (pi-ui--render-message message)
+                          (equal (plist-get message :role) "toolResult")))
+          (dolist (item transients)
+            (insert-entry (pi-ui--render-transient-item item)
+                          (eq (plist-get item :kind) 'tool-result)))
+          (when live
+            (insert-entry (pi-ui--render-message live)
+                          (equal (plist-get live :role) "toolResult")))))
       (goto-char (point-max))
       (when pi-ui-auto-scroll
         (dolist (entry follow-windows)
@@ -935,10 +1106,23 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
 
 (defun pi-ui--tool-result-from-event (event)
   (let* ((result (plist-get event :result))
+         (tool-name (or (plist-get event :toolName)
+                        (and result (plist-get result :toolName))))
+         (tool-call-id (or (plist-get event :toolCallId)
+                           (plist-get event :toolUseId)
+                           (plist-get event :callId)
+                           (and result (plist-get result :toolCallId))
+                           (and result (plist-get result :toolUseId))
+                           (and result (plist-get result :callId))))
+         (arguments (or (pi-ui--tool-arguments-from-object event)
+                        (and result (pi-ui--tool-arguments-from-object result))))
          (content (and result (plist-get result :content))))
     (when (or result (plist-get event :error))
       (list :kind 'tool-result
-            :tool-name (plist-get event :toolName)
+            :tool-name tool-name
+            :tool-call-id tool-call-id
+            :arguments arguments
+            :detail (pi-ui--tool-detail-from-arguments tool-name arguments)
             :status (pi-ui--tool-status-from-event event)
             :duration-ms (pi-ui--tool-duration-from-event event)
             :text (cond
