@@ -17,13 +17,6 @@
 (require 'markdown-mode nil t)
 
 (declare-function pi-session-get-commands "pi-session" (session callback))
-(declare-function pi-session-new-session "pi-session" (session &optional callback))
-(declare-function pi-session-compact "pi-session" (session &optional custom-instructions callback))
-(declare-function pi-session-export-html "pi-session" (session &optional output-path callback))
-(declare-function pi-session-cycle-model "pi-session" (session &optional callback))
-(declare-function pi-session-set-thinking-level "pi-session" (session level &optional callback))
-(declare-function pi-session-cycle-thinking-level "pi-session" (session &optional callback))
-(declare-function pi-session-restart "pi-session" (session))
 
 (defgroup pi-ui nil
   "UI for pi session buffers."
@@ -163,21 +156,6 @@ Lower values feel more immediate but may increase UI load."
 (defvar-local pi-ui--prompt-command-cache nil)
 (defvar-local pi-ui--prompt-command-metadata nil)
 (defvar-local pi-ui--prompt-command-loading nil)
-
-(defconst pi-ui--builtin-command-metadata
-  '(("new" . " [builtin]")
-    ("clear" . " [builtin]")
-    ("compact" . " [builtin]")
-    ("abort" . " [builtin]")
-    ("export" . " [builtin]")
-    ("model" . " [builtin]")
-    ("thinking" . " [builtin]")
-    ("reload" . " [builtin]"))
-  "Tier-1 built-in slash commands handled directly by the Emacs client.")
-
-(defconst pi-ui--thinking-levels
-  '("off" "minimal" "low" "medium" "high" "xhigh")
-  "Supported thinking levels for `/thinking LEVEL`.")
 
 (defvar pi-prompt-buffer-mode-map
   (let ((map (make-sparse-keymap)))
@@ -349,15 +327,10 @@ Lower values feel more immediate but may increase UI load."
       (cons (1+ start) end))))
 
 (defun pi-ui--prompt-command-candidates ()
-  (sort (delete-dups
-         (append (mapcar #'car pi-ui--builtin-command-metadata)
-                 (or pi-ui--prompt-command-cache '())))
-        #'string-lessp))
+  (or pi-ui--prompt-command-cache '()))
 
 (defun pi-ui--prompt-command-annotation (candidate)
-  (or (cdr (assoc candidate pi-ui--prompt-command-metadata))
-      (cdr (assoc candidate pi-ui--builtin-command-metadata))
-      " [command]"))
+  (or (cdr (assoc candidate pi-ui--prompt-command-metadata)) " [command]"))
 
 (defun pi-ui--prompt-prefetch-commands (prompt-buffer source-buffer)
   (when (and (buffer-live-p prompt-buffer)
@@ -407,6 +380,8 @@ Lower values feel more immediate but may increase UI load."
     (user-error "Not in a pi prompt buffer"))
   (unless (or pi-ui--prompt-command-cache pi-ui--prompt-command-loading)
     (pi-ui--prompt-prefetch-commands (current-buffer) pi-ui--prompt-source-buffer))
+  (when pi-ui--prompt-command-loading
+    (user-error "Loading /commands, try again in a moment"))
   (let* ((commands (pi-ui--prompt-command-candidates))
          (choice (completing-read "Slash command: " commands nil t))
          (bounds (pi-ui--prompt-command-bounds)))
@@ -439,122 +414,6 @@ Lower values feel more immediate but may increase UI load."
   (interactive)
   (quit-window t))
 
-(defun pi-ui--rpc-success-p (response)
-  (not (eq (plist-get response :success) :json-false)))
-
-(defun pi-ui--parse-builtin-command (prompt)
-  (let ((trimmed (string-trim prompt)))
-    (when (string-match "\\`/\\([^ \t\n]+\\)\\([[:space:]].*\\)?\\'" trimmed)
-      (let* ((name (downcase (match-string 1 trimmed)))
-             (args (string-trim (or (match-string 2 trimmed) ""))))
-        (when (assoc name pi-ui--builtin-command-metadata)
-          (list name (unless (string-empty-p args) args)))))))
-
-(defun pi-ui--refresh-session-ui (session source-buffer)
-  (let ((buffer (or (pi-ui--get-buffer session)
-                    (pi-ui--ensure-buffer session source-buffer))))
-    (pi-ui--refresh-session-buffer session buffer)))
-
-(defun pi-ui--require-empty-args (command args)
-  (when (and (stringp args) (not (string-empty-p args)))
-    (user-error "/%s does not accept arguments" command)))
-
-(defun pi-ui--dispatch-builtin-command (source-buffer command args)
-  (let ((session (pi-session-ensure-for-buffer source-buffer)))
-    (pi-ui-show-session-buffer session source-buffer)
-    (pcase command
-      ((or "new" "clear")
-       (pi-ui--require-empty-args command args)
-       (pi-session-new-session
-        session
-        (lambda (s response)
-          (if (pi-ui--rpc-success-p response)
-              (progn
-                (pi-ui--refresh-session-ui s source-buffer)
-                (message "pi: started a new session"))
-            (message "pi: %s" (or (plist-get response :error)
-                                  "Failed to start a new session"))))))
-      ("compact"
-       (pi-session-compact
-        session args
-        (lambda (s response)
-          (if (pi-ui--rpc-success-p response)
-              (progn
-                (pi-ui--refresh-session-ui s source-buffer)
-                (message "pi: compacted session context"))
-            (message "pi: %s" (or (plist-get response :error)
-                                  "Failed to compact session"))))))
-      ("abort"
-       (pi-ui--require-empty-args command args)
-       (pi-session-abort
-        session
-        (lambda (_s response)
-          (if (pi-ui--rpc-success-p response)
-              (message "pi: aborted current run")
-            (message "pi: %s" (or (plist-get response :error)
-                                  "Failed to abort"))))))
-      ("export"
-       (let ((output-path (and (stringp args)
-                               (not (string-empty-p args))
-                               (with-current-buffer source-buffer
-                                 (expand-file-name args default-directory)))))
-         (pi-session-export-html
-          session output-path
-          (lambda (_s response)
-            (if (pi-ui--rpc-success-p response)
-                (let ((path (plist-get (plist-get response :data) :path)))
-                  (message "pi: exported session to %s" (or path output-path "HTML file")))
-              (message "pi: %s" (or (plist-get response :error)
-                                    "Failed to export session")))))))
-      ("model"
-       (pi-ui--require-empty-args command args)
-       (pi-session-cycle-model
-        session
-        (lambda (_s response)
-          (if (pi-ui--rpc-success-p response)
-              (let* ((data (plist-get response :data))
-                     (model (and data (plist-get data :model)))
-                     (name (or (and model (plist-get model :name))
-                               (and model (plist-get model :id)))))
-                (message "%s" (if name
-                                   (format "pi: switched model to %s" name)
-                                 "pi: model unchanged")))
-            (message "pi: %s" (or (plist-get response :error)
-                                  "Failed to cycle model"))))))
-      ("thinking"
-       (let ((level (and (stringp args)
-                         (not (string-empty-p args))
-                         (downcase args))))
-         (if level
-             (progn
-               (unless (member level pi-ui--thinking-levels)
-                 (user-error "Unknown thinking level: %s" level))
-               (pi-session-set-thinking-level
-                session level
-                (lambda (_s response)
-                  (if (pi-ui--rpc-success-p response)
-                      (message "pi: set thinking level to %s" level)
-                    (message "pi: %s" (or (plist-get response :error)
-                                          "Failed to set thinking level"))))))
-           (pi-session-cycle-thinking-level
-            session
-            (lambda (_s response)
-              (if (pi-ui--rpc-success-p response)
-                  (let* ((data (plist-get response :data))
-                         (next-level (and data (plist-get data :level))))
-                    (message "%s" (if next-level
-                                       (format "pi: thinking level is now %s" next-level)
-                                     "pi: thinking level unchanged")))
-                (message "pi: %s" (or (plist-get response :error)
-                                      "Failed to cycle thinking level"))))))))
-      ("reload"
-       (pi-ui--require-empty-args command args)
-       (pi-session-restart session)
-       (pi-ui--refresh-session-ui session source-buffer)
-       (message "pi: reloaded session"))
-      (_
-       (user-error "Unsupported built-in command: /%s" command)))))
-
 (defun pi-ui-prompt-submit ()
   "Submit the current prompt buffer content."
   (interactive)
@@ -566,17 +425,14 @@ Lower values feel more immediate but may increase UI load."
          (target-window (or (and (buffer-live-p source-buffer)
                                  (get-buffer-window source-buffer t))
                             pi-ui--prompt-source-window))
-         (prompt (string-trim (buffer-substring-no-properties (point-min) (point-max))))
-         (builtin (pi-ui--parse-builtin-command prompt)))
+         (prompt (string-trim (buffer-substring-no-properties (point-min) (point-max)))))
     (unless (buffer-live-p source-buffer)
       (user-error "Original source buffer is no longer available"))
     (when (string-empty-p prompt)
       (user-error "Prompt is empty"))
     (when (window-live-p target-window)
       (select-window target-window))
-    (if builtin
-        (pi-ui--dispatch-builtin-command source-buffer (car builtin) (cadr builtin))
-      (pi-ui-send-prompt source-buffer prompt))
+    (pi-ui-send-prompt source-buffer prompt)
     (when (window-live-p prompt-window)
       (quit-window t prompt-window))))
 
