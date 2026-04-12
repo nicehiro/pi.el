@@ -544,7 +544,7 @@ INITIAL-TEXT pre-fills the prompt buffer."
     (add-hook 'kill-buffer-hook #'pi-ui--session-buffer-killed nil t)))
 
 (defun pi-ui--session-buffer-name (session)
-  (format "*pi:%s*" (pi-session-name session)))
+  (format "*pi:%s*" (pi-session-display-name session)))
 
 (defun pi-ui--get-buffer (session)
   (gethash (pi-session-id session) pi-ui--session-buffers))
@@ -984,7 +984,7 @@ INITIAL-TEXT pre-fills the prompt buffer."
       (pi-ui--rebuild-tool-call-summary-index history live)
       (pi-ui--update-session-header-line buffer)
       (erase-buffer)
-      (insert (propertize (format "pi session: %s\n" (pi-session-name session))
+      (insert (propertize (format "pi session: %s\n" (pi-session-display-name session))
                           'face 'pi-ui-session-title-face))
       (insert (propertize (format "scope: %s\nroot: %s\n\n"
                                   (pi-session-scope session)

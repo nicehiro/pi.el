@@ -21,7 +21,10 @@
 (declare-function pi-ui-send-prompt "pi-ui" (source-buffer prompt))
 (declare-function pi-ui-compose-prompt "pi-ui" (&optional source-buffer initial-text))
 
+(declare-function pi-session-current-for-buffer "pi-session" (&optional buffer))
 (declare-function pi-session-new-session "pi-session" (session &optional callback))
+(declare-function pi-session-resume "pi-session" (session session-file &optional callback))
+(declare-function pi-session-saved-sessions-for-buffer "pi-session" (&optional buffer))
 (declare-function pi-session-get-available-models "pi-session" (session callback))
 (declare-function pi-session-compact "pi-session" (session &optional custom-instructions callback))
 (declare-function pi-session-export-html "pi-session" (session &optional output-path callback))
@@ -41,9 +44,10 @@
 
 (defvar pi-command-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "o") #'pi-open)
+    (define-key map (kbd "o") #'pi)
     (define-key map (kbd "p") #'pi-prompt)
     (define-key map (kbd "n") #'pi-new-session)
+    (define-key map (kbd "R") #'pi-resume-session)
     (define-key map (kbd "c") #'pi-compact-session)
     (define-key map (kbd "a") #'pi-abort)
     (define-key map (kbd "e") #'pi-export-session-html)
@@ -58,16 +62,19 @@
 
 (define-key pi-command-map (kbd "s") #'pi-set-model)
 
-(defun pi-open ()
-  "Open and focus the current buffer scope session."
+(defun pi ()
+  "Open the current buffer scope session.
+
+If the scope has a saved active session, resume it automatically. Otherwise
+create a new session for the scope."
   (interactive)
   (pi-ui-open-session (current-buffer)))
 
 (defun pi--rpc-success-p (response)
   (not (eq (plist-get response :success) :json-false)))
 
-(defun pi--ensure-session (source-buffer)
-  (let ((session (pi-session-ensure-for-buffer source-buffer)))
+(defun pi--ensure-session (source-buffer &optional session-file)
+  (let ((session (pi-session-ensure-for-buffer source-buffer session-file)))
     (pi-ui-show-session-buffer session source-buffer)
     session))
 
@@ -91,10 +98,81 @@
         (format "%s — %s" name ref)
       name)))
 
+(defun pi--saved-session-label (saved-session)
+  (let* ((path (plist-get saved-session :path))
+         (name (plist-get saved-session :name))
+         (preview (plist-get saved-session :preview))
+         (session-id (or (plist-get saved-session :session-id)
+                         (file-name-base (or path ""))))
+         (short-id (if (and (stringp session-id)
+                            (> (length session-id) 8))
+                       (substring session-id 0 8)
+                     session-id))
+         (modified (plist-get saved-session :modified))
+         (message-count (plist-get saved-session :message-count))
+         (title (or (and (stringp name)
+                         (not (string-empty-p name))
+                         name)
+                    (and (stringp preview)
+                         (not (string-empty-p preview))
+                         (replace-regexp-in-string "[\n\r\t ]+" " " preview))
+                    (and path (file-name-base path))
+                    "session")))
+    (format "%s — %s%s [%s]"
+            title
+            (if (and modified (listp modified))
+                (format-time-string "%Y-%m-%d %H:%M" modified)
+              "unknown time")
+            (if (and (integerp message-count)
+                     (> message-count 0))
+                (format " · %d msgs" message-count)
+              "")
+            short-id)))
+
 (defun pi-prompt ()
   "Compose and send a prompt to the current buffer scope session."
   (interactive)
   (pi-ui-compose-prompt (current-buffer)))
+
+(defun pi-resume-session ()
+  "Select and resume a saved session for the current buffer scope."
+  (interactive)
+  (let* ((source-buffer (current-buffer))
+         (saved-sessions (pi-session-saved-sessions-for-buffer source-buffer)))
+    (if (null saved-sessions)
+        (message "pi: no saved sessions for this project")
+      (let* ((choices (mapcar (lambda (saved-session)
+                                (cons (pi--saved-session-label saved-session)
+                                      saved-session))
+                              saved-sessions))
+             (current-session (pi-session-current-for-buffer source-buffer))
+             (current-file (and current-session
+                                (pi-session-session-file current-session)))
+             (default-choice
+              (car (seq-find (lambda (entry)
+                               (equal (plist-get (cdr entry) :path)
+                                      current-file))
+                             choices)))
+             (selection (let ((completion-extra-properties
+                               '(:display-sort-function identity
+                                 :cycle-sort-function identity)))
+                          (completing-read
+                           "Resume session: "
+                           (mapcar #'car choices)
+                           nil t nil nil default-choice)))
+             (saved-session (cdr (assoc selection choices)))
+             (session-file (plist-get saved-session :path))
+             (session (pi--ensure-session source-buffer session-file)))
+        (pi-session-resume
+         session session-file
+         (lambda (s response)
+           (if (pi--rpc-success-p response)
+               (progn
+                 (pi-ui-show-session-buffer s source-buffer)
+                 (message "pi: resumed session"))
+             (message "pi: %s"
+                      (or (plist-get response :error)
+                          "Failed to resume session")))))))))
 
 (defun pi-new-session ()
   "Start a fresh session for the current buffer scope."
