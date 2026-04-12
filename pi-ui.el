@@ -598,7 +598,11 @@ INITIAL-TEXT pre-fills the prompt buffer."
               (format "\n... [%d more lines hidden]" (- count max-lines))))))
 
 (defun pi-ui--truncate-inline (text max-length)
-  (let* ((flat (replace-regexp-in-string "[\n\r\t]+" " " (or text "")))
+  (let* ((raw (cond
+               ((null text) "")
+               ((stringp text) text)
+               (t (format "%s" text))))
+         (flat (replace-regexp-in-string "[\n\r\t]+" " " raw))
          (trimmed (string-trim flat)))
     (if (> (length trimmed) max-length)
         (concat (substring trimmed 0 (max 0 (1- max-length))) "…")
@@ -713,16 +717,21 @@ INITIAL-TEXT pre-fills the prompt buffer."
              (dolist (block (plist-get message :content))
                (when (and (listp block)
                           (equal (plist-get block :type) "toolCall"))
-                 (let* ((tool-call-id (or (plist-get block :id)
-                                          (plist-get block :toolCallId)))
+                 (let* ((tool-call-ids
+                         (delq nil
+                               (list (plist-get block :id)
+                                     (plist-get block :toolCallId)
+                                     (plist-get block :toolUseId)
+                                     (plist-get block :callId))))
                         (tool-name (or (plist-get block :name)
                                        (plist-get block :toolName)))
                         (args (pi-ui--tool-arguments-from-object block))
                         (detail (pi-ui--tool-detail-from-arguments tool-name args)))
-                   (when (and (stringp tool-call-id)
-                              (not (string-empty-p tool-call-id))
-                              detail)
-                     (puthash tool-call-id detail table))))))))
+                   (when detail
+                     (dolist (tool-call-id tool-call-ids)
+                       (when (and (stringp tool-call-id)
+                                  (not (string-empty-p tool-call-id)))
+                         (puthash tool-call-id detail table))))))))))
       (dolist (message history)
         (collect message))
       (collect live))
@@ -738,7 +747,9 @@ INITIAL-TEXT pre-fills the prompt buffer."
   (or (pi-ui--tool-detail-from-arguments
        (plist-get message :toolName)
        (pi-ui--tool-arguments-from-object message))
-      (pi-ui--tool-detail-for-call-id (plist-get message :toolCallId))))
+      (pi-ui--tool-detail-for-call-id (plist-get message :toolCallId))
+      (pi-ui--tool-detail-for-call-id (plist-get message :toolUseId))
+      (pi-ui--tool-detail-for-call-id (plist-get message :callId))))
 
 (defun pi-ui--tool-detail-from-item (item)
   (or (plist-get item :detail)
