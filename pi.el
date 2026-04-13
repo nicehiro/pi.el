@@ -60,8 +60,6 @@
     map)
   "Prefix keymap for pi commands.")
 
-(define-key pi-command-map (kbd "s") #'pi-set-model)
-
 (defun pi ()
   "Open the current buffer scope session.
 
@@ -109,7 +107,6 @@ create a new session for the scope."
                        (substring session-id 0 8)
                      session-id))
          (modified (plist-get saved-session :modified))
-         (message-count (plist-get saved-session :message-count))
          (title (or (and (stringp name)
                          (not (string-empty-p name))
                          name)
@@ -118,15 +115,11 @@ create a new session for the scope."
                          (replace-regexp-in-string "[\n\r\t ]+" " " preview))
                     (and path (file-name-base path))
                     "session")))
-    (format "%s — %s%s [%s]"
+    (format "%s — %s [%s]"
             title
             (if (and modified (listp modified))
                 (format-time-string "%Y-%m-%d %H:%M" modified)
               "unknown time")
-            (if (and (integerp message-count)
-                     (> message-count 0))
-                (format " · %d msgs" message-count)
-              "")
             short-id)))
 
 (defun pi-prompt ()

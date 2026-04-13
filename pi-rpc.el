@@ -253,10 +253,6 @@ COMMAND may be a plist or alist."
                         (pi-rpc--normalize-command command)))
   t)
 
-(defun pi-rpc-set-event-handler (rpc fn)
-  "Set RPC event handler FN for RPC."
-  (setf (pi-rpc-event-handler rpc) fn))
-
 (provide 'pi-rpc)
 
 ;;; pi-rpc.el ends here

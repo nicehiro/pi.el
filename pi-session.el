@@ -249,7 +249,6 @@ transcripts just to show picker labels."
               :session-id session-id
               :cwd cwd
               :name name
-              :message-count nil
               :preview preview
               :modified modified))
     (error nil)))
@@ -282,12 +281,6 @@ The plist keys are :kind, :root, :name, and :key."
   "Return existing session for BUFFER scope, or nil."
   (pi-session--lookup-scope (pi-session-scope-for-buffer buffer)))
 
-(defun pi-session-active-file-for-buffer (&optional buffer)
-  "Return the persisted active session file for BUFFER scope, or nil."
-  (let* ((scope (pi-session-scope-for-buffer buffer))
-         (scope-key (plist-get scope :key)))
-    (pi-session--get-active-file scope-key)))
-
 (defun pi-session-saved-sessions-for-buffer (&optional buffer)
   "Return saved session metadata for BUFFER scope, newest first."
   (let* ((scope (pi-session-scope-for-buffer buffer))
@@ -314,14 +307,6 @@ The plist keys are :kind, :root, :name, and :key."
                                            (pi-session-id session)))
                                   pi-session--known-sessions)))
   session)
-
-(defun pi-session--unregister (session)
-  (remhash (pi-session-scope-key session) pi-session--by-scope)
-  (setq pi-session--known-sessions
-        (seq-remove (lambda (it)
-                      (equal (pi-session-id it)
-                             (pi-session-id session)))
-                    pi-session--known-sessions)))
 
 (defun pi-session--cancel-idle-timer (session)
   (when-let* ((timer (pi-session-idle-timer session)))
@@ -540,17 +525,6 @@ as the initial session file to resume."
           session)
       (pi-session--create-for-scope scope session-file))))
 
-(defun pi-session-refresh-state (session callback)
-  "Refresh SESSION state and invoke CALLBACK with SESSION and RESPONSE."
-  (pi-session--ensure-running
-   session
-   (lambda (_session)
-     (pi-session--request-state
-      session
-      (lambda (_s _state response)
-        (when callback
-          (funcall callback session response)))))))
-
 (defun pi-session-send-prompt (session message &optional callback)
   "Send MESSAGE through SESSION.
 CALLBACK receives `(SESSION RESPONSE)'."
@@ -577,34 +551,38 @@ CALLBACK receives `(SESSION RESPONSE)'."
           (when callback
             (funcall callback session response))))))))
 
+(defun pi-session--normalize-extension-ui-payload (payload)
+  "Normalize PAYLOAD for an extension UI response."
+  (cond
+   ((null payload) nil)
+   ((and (listp payload) (keywordp (car payload)))
+    (let (result)
+      (while payload
+        (let ((raw-key (pop payload))
+              (raw-val (pop payload)))
+          (push (cons (substring (symbol-name raw-key) 1) raw-val) result)))
+      (nreverse result)))
+   ((and (listp payload)
+         (or (null payload)
+             (consp (car payload))))
+    payload)
+   (t
+    (user-error "Unsupported extension UI payload: %S" payload))))
+
 (defun pi-session-send-extension-ui-response (session request-id payload)
-  "Reply to an outstanding extension UI REQUEST-ID in SESSION.
-PAYLOAD is an alist or plist containing response fields such as
-`(("value" . "foo"))', `(("confirmed" . t))', or `(("cancelled" . t))'."
+  "Reply to extension UI REQUEST-ID in SESSION using PAYLOAD."
   (unless session
     (user-error "No pi session selected"))
   (unless (and (pi-session-rpc session)
                (pi-rpc-live-p (pi-session-rpc session)))
     (user-error "Pi session is not running"))
-  (let ((payload
-         (cond
-          ((null payload) nil)
-          ((and (listp payload) (keywordp (car payload)))
-           (let (result)
-             (while payload
-               (let* ((raw-key (pop payload))
-                      (value (pop payload))
-                      (key (substring (symbol-name raw-key) 1)))
-                 (push (cons key value) result)))
-             (nreverse result)))
-          ((listp payload) payload)
-          (t (user-error "Unsupported extension UI payload: %S" payload)))))
+  (let ((normalized-payload (pi-session--normalize-extension-ui-payload payload)))
     (pi-session--touch session)
     (pi-rpc-notify
      (pi-session-rpc session)
      (append `(("type" . "extension_ui_response")
                ("id" . ,request-id))
-             payload))))
+             normalized-payload))))
 
 (defun pi-session-abort (session &optional callback)
   "Abort the current run in SESSION."
