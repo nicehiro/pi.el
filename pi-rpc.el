@@ -243,6 +243,16 @@ COMMAND may be a plist or alist.  Returns the generated request id."
                          (pi-rpc--encode-command command-with-id))
     id))
 
+(defun pi-rpc-notify (rpc command)
+  "Send COMMAND over RPC without tracking a response.
+COMMAND may be a plist or alist."
+  (unless (pi-rpc-live-p rpc)
+    (error "RPC process is not running"))
+  (process-send-string (pi-rpc-process rpc)
+                       (pi-rpc--encode-command
+                        (pi-rpc--normalize-command command)))
+  t)
+
 (defun pi-rpc-set-event-handler (rpc fn)
   "Set RPC event handler FN for RPC."
   (setf (pi-rpc-event-handler rpc) fn))

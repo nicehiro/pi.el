@@ -577,6 +577,35 @@ CALLBACK receives `(SESSION RESPONSE)'."
           (when callback
             (funcall callback session response))))))))
 
+(defun pi-session-send-extension-ui-response (session request-id payload)
+  "Reply to an outstanding extension UI REQUEST-ID in SESSION.
+PAYLOAD is an alist or plist containing response fields such as
+`(("value" . "foo"))', `(("confirmed" . t))', or `(("cancelled" . t))'."
+  (unless session
+    (user-error "No pi session selected"))
+  (unless (and (pi-session-rpc session)
+               (pi-rpc-live-p (pi-session-rpc session)))
+    (user-error "Pi session is not running"))
+  (let ((payload
+         (cond
+          ((null payload) nil)
+          ((and (listp payload) (keywordp (car payload)))
+           (let (result)
+             (while payload
+               (let* ((raw-key (pop payload))
+                      (value (pop payload))
+                      (key (substring (symbol-name raw-key) 1)))
+                 (push (cons key value) result)))
+             (nreverse result)))
+          ((listp payload) payload)
+          (t (user-error "Unsupported extension UI payload: %S" payload)))))
+    (pi-session--touch session)
+    (pi-rpc-notify
+     (pi-session-rpc session)
+     (append `(("type" . "extension_ui_response")
+               ("id" . ,request-id))
+             payload))))
+
 (defun pi-session-abort (session &optional callback)
   "Abort the current run in SESSION."
   (unless session
