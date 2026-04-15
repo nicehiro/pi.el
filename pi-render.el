@@ -20,6 +20,12 @@
 (defvar pi-ui-tool-result-max-lines)
 (defvar pi-ui-tool-display-style)
 
+(defconst pi-ui--spinner-frames
+  ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"])
+
+(defvar pi-ui--spinner-timer nil)
+(defvar pi-ui--spinner-frame-index 0)
+
 (defvar pi-ui-session-title-face)
 (defvar pi-ui-meta-face)
 (defvar pi-ui-user-heading-face)
@@ -44,12 +50,45 @@
            ((and provider id) (format "%s/%s" provider id))
            (id id))))))
 
+(defun pi-ui--spinner-frame ()
+  (aref pi-ui--spinner-frames
+        (mod pi-ui--spinner-frame-index (length pi-ui--spinner-frames))))
+
+(defun pi-ui--visible-streaming-session-buffer-p (buffer)
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (and (bound-and-true-p pi-ui--session)
+           (plist-get (pi-session-cached-state pi-ui--session) :is-streaming)
+           (get-buffer-window buffer t)))))
+
+(defun pi-ui--stop-spinner-timer ()
+  (when (timerp pi-ui--spinner-timer)
+    (cancel-timer pi-ui--spinner-timer))
+  (setq pi-ui--spinner-timer nil
+        pi-ui--spinner-frame-index 0))
+
+(defun pi-ui--spinner-tick ()
+  (let ((buffers (seq-filter #'pi-ui--visible-streaming-session-buffer-p
+                             (buffer-list))))
+    (if (null buffers)
+        (pi-ui--stop-spinner-timer)
+      (setq pi-ui--spinner-frame-index (1+ pi-ui--spinner-frame-index))
+      (dolist (buffer buffers)
+        (with-current-buffer buffer
+          (force-mode-line-update))))))
+
+(defun pi-ui--ensure-spinner-timer ()
+  (if (seq-some #'pi-ui--visible-streaming-session-buffer-p (buffer-list))
+      (unless (timerp pi-ui--spinner-timer)
+        (setq pi-ui--spinner-timer (run-at-time 0 0.1 #'pi-ui--spinner-tick)))
+    (pi-ui--stop-spinner-timer)))
+
 (defun pi-ui--session-header-line (session)
   (when session
     (let* ((state (pi-session-cached-state session))
            (items nil))
       (push (if (plist-get state :is-streaming)
-                "● Working"
+                (format "%s Working" (pi-ui--spinner-frame))
               "○ Idle")
             items)
       (when-let* ((model-name (pi-ui--session-model-name session)))
@@ -65,7 +104,8 @@
                 '(:eval
                   (and (boundp 'pi-ui--session)
                        (pi-ui--session-header-line pi-ui--session))))
-    (force-mode-line-update t)))
+    (pi-ui--ensure-spinner-timer)
+    (force-mode-line-update)))
 
 (defun pi-ui--stringify-content-block (block)
   (pcase (plist-get block :type)

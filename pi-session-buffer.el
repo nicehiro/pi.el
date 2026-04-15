@@ -134,12 +134,16 @@
     (pi-ui--register-buffer session buffer)))
 
 (defun pi-ui--display-buffer (buffer)
-  (display-buffer-in-side-window
-   buffer
-   `((side . ,pi-ui-window-side)
-     ,@(if (memq pi-ui-window-side '(left right))
-           `((window-width . ,pi-ui-window-size))
-         `((window-height . ,pi-ui-window-size))))))
+  (let ((window
+         (display-buffer-in-side-window
+          buffer
+          `((side . ,pi-ui-window-side)
+            ,@(if (memq pi-ui-window-side '(left right))
+                  `((window-width . ,pi-ui-window-size))
+                `((window-height . ,pi-ui-window-size)))))))
+    (when (window-live-p window)
+      (pi-ui--update-session-header-line buffer))
+    window))
 
 (defun pi-ui--window-at-bottom-p (window)
   (with-current-buffer (window-buffer window)
