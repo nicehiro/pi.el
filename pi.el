@@ -25,6 +25,8 @@
 (declare-function pi-session-new-session "pi-session" (session &optional callback))
 (declare-function pi-session-resume "pi-session" (session session-file &optional callback))
 (declare-function pi-session-saved-sessions-for-buffer "pi-session" (&optional buffer))
+(declare-function pi-session-tree-nodes "pi-session" (session))
+(declare-function pi-session-checkout-tree-entry "pi-session" (session entry-id callback))
 (declare-function pi-session-get-available-models "pi-session" (session callback))
 (declare-function pi-session-compact "pi-session" (session &optional custom-instructions callback))
 (declare-function pi-session-export-html "pi-session" (session &optional output-path callback))
@@ -33,6 +35,9 @@
 (declare-function pi-session-set-thinking-level "pi-session" (session level &optional callback))
 (declare-function pi-session-cycle-thinking-level "pi-session" (session &optional callback))
 (declare-function pi-session-restart "pi-session" (session))
+
+(defvar pi-ui--session)
+(defvar pi-ui--source-buffer)
 
 (defgroup pi nil
   "Emacs integration for pi."
@@ -51,6 +56,7 @@
     (define-key map (kbd "c") #'pi-compact-session)
     (define-key map (kbd "a") #'pi-abort)
     (define-key map (kbd "e") #'pi-export-session-html)
+    (define-key map (kbd "j") #'pi-tree)
     (define-key map (kbd "m") #'pi-cycle-model)
     (define-key map (kbd "s") #'pi-set-model)
     (define-key map (kbd "t") #'pi-cycle-thinking-level)
@@ -121,6 +127,67 @@ create a new session for the scope."
                 (format-time-string "%Y-%m-%d %H:%M" modified)
               "unknown time")
             short-id)))
+
+(defun pi--tree-source-buffer ()
+  (if (and (derived-mode-p 'pi-session-buffer-mode)
+           (buffer-live-p pi-ui--source-buffer))
+      pi-ui--source-buffer
+    (current-buffer)))
+
+(defun pi--existing-session-for-tree (&optional source-buffer)
+  (or (and (derived-mode-p 'pi-session-buffer-mode)
+           (bound-and-true-p pi-ui--session))
+      (pi-session-current-for-buffer source-buffer)
+      (user-error "pi: no existing session for this scope")))
+
+(defun pi--tree-node-reeditable-p (node)
+  (let* ((entry (plist-get node :entry))
+         (type (plist-get entry :type)))
+    (or (equal type "custom_message")
+        (and (equal type "message")
+             (equal (plist-get (plist-get entry :message) :role) "user")))))
+
+(defun pi-tree ()
+  "Open a picker for the current session tree and switch to the selected point."
+  (interactive)
+  (let* ((source-buffer (pi--tree-source-buffer))
+         (session (pi--existing-session-for-tree source-buffer))
+         (nodes (pi-session-tree-nodes session)))
+    (unless nodes
+      (user-error "pi: current session tree is empty"))
+    (let* ((choices (mapcar (lambda (node)
+                              (cons (plist-get node :display) node))
+                            nodes))
+           (default-choice (car (seq-find (lambda (choice)
+                                            (plist-get (cdr choice) :current))
+                                          choices)))
+           (selection (let ((completion-extra-properties
+                             '(:display-sort-function identity
+                               :cycle-sort-function identity)))
+                        (completing-read "Session tree: "
+                                         (mapcar #'car choices)
+                                         nil t nil nil default-choice)))
+           (node (cdr (assoc selection choices))))
+      (when node
+        (if (and (plist-get node :current)
+                 (not (pi--tree-node-reeditable-p node)))
+            (message "pi: already at this point")
+          (pi-session-checkout-tree-entry
+           session
+           (plist-get node :id)
+           (lambda (s response)
+             (if (pi--rpc-success-p response)
+                 (let ((editor-text (plist-get (plist-get response :data) :editor-text)))
+                   (pi-ui-show-session-buffer s source-buffer)
+                   (if (and (stringp editor-text)
+                            (not (string-empty-p editor-text)))
+                       (progn
+                         (message "pi: rewound session; edit the prompt to continue")
+                         (pi-ui-compose-prompt source-buffer editor-text))
+                     (message "pi: moved to selected tree entry")))
+               (message "pi: %s"
+                        (or (plist-get response :error)
+                            "Failed to switch to the selected tree entry"))))))))))
 
 (defun pi-prompt ()
   "Compose and send a prompt to the current buffer scope session."

@@ -16,6 +16,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 (require 'seq)
 (require 'subr-x)
 (require 'pi-rpc)
@@ -156,22 +157,24 @@ transcripts just to show picker labels."
                      :false-object :json-false
                      :null-object nil))
 
+(defun pi-session--content-text (content)
+  (string-trim
+   (cond
+    ((stringp content) content)
+    ((listp content)
+     (string-join
+      (delq nil
+            (mapcar (lambda (block)
+                      (when (and (listp block)
+                                 (equal (plist-get block :type) "text"))
+                        (let ((text (plist-get block :text)))
+                          (and (stringp text) text))))
+                    content))
+      "\n"))
+    (t ""))))
+
 (defun pi-session--message-text (message)
-  (let ((content (plist-get message :content)))
-    (string-trim
-     (cond
-      ((stringp content) content)
-      ((listp content)
-       (string-join
-        (delq nil
-              (mapcar (lambda (block)
-                        (when (and (listp block)
-                                   (equal (plist-get block :type) "text"))
-                          (let ((text (plist-get block :text)))
-                            (and (stringp text) text))))
-                      content))
-        "\n"))
-      (t "")))))
+  (pi-session--content-text (plist-get message :content)))
 
 (defun pi-session--read-jsonl-slice (path start end file-size)
   (let (entries)
@@ -252,6 +255,316 @@ transcripts just to show picker labels."
               :preview preview
               :modified modified))
     (error nil)))
+
+(defun pi-session--read-jsonl-records (path)
+  (let (records)
+    (with-temp-buffer
+      (insert-file-contents path)
+      (goto-char (point-min))
+      (while (not (eobp))
+        (let* ((line (buffer-substring-no-properties
+                      (line-beginning-position)
+                      (line-end-position)))
+               (trimmed (string-trim line))
+               (entry (and (not (string-empty-p trimmed))
+                           (condition-case nil
+                               (pi-session--json-line-object trimmed)
+                             (error nil)))))
+          (when entry
+            (push (list :line trimmed :entry entry) records)))
+        (forward-line 1)))
+    (nreverse records)))
+
+(defun pi-session--session-file-records (session)
+  (let ((path (pi-session-session-file session)))
+    (unless (and (stringp path)
+                 (not (string-empty-p path))
+                 (file-readable-p path))
+      (user-error "pi: current session has no readable persisted transcript"))
+    (pi-session--read-jsonl-records path)))
+
+(defun pi-session--visible-tree-entry-p (entry)
+  (let ((type (plist-get entry :type)))
+    (cond
+     ((member type '("label" "custom" "model_change" "thinking_level_change" "session_info")) nil)
+     ((not (equal type "message")) t)
+     (t
+      (let* ((message (plist-get entry :message))
+             (role (plist-get message :role)))
+        (if (not (equal role "assistant"))
+            t
+          (let ((text (pi-session--message-text message))
+                (stop-reason (plist-get message :stopReason))
+                (error-message (plist-get message :errorMessage)))
+            (or (not (string-empty-p text))
+                (and (stringp error-message)
+                     (not (string-empty-p error-message)))
+                (and (stringp stop-reason)
+                     (not (member stop-reason '("stop" "toolUse"))))))))))))
+
+(defun pi-session--tree-entry-text (entry)
+  (pcase (plist-get entry :type)
+    ("message"
+     (let* ((message (plist-get entry :message))
+            (role (plist-get message :role))
+            (text (pi-session--message-text message)))
+       (pcase role
+         ("user" (format "user: %s" text))
+         ("assistant"
+          (cond
+           ((not (string-empty-p text)) (format "assistant: %s" text))
+           ((equal (plist-get message :stopReason) "aborted") "assistant: (aborted)")
+           ((let ((error-message (plist-get message :errorMessage)))
+              (and (stringp error-message) (not (string-empty-p error-message))))
+            (format "assistant: %s" (plist-get message :errorMessage)))
+           (t "assistant: (no content)")))
+         ("toolResult"
+          (format "[%s]"
+                  (or (plist-get message :toolName)
+                      (plist-get message :toolCallId)
+                      "tool")))
+         ("bashExecution"
+          (format "[bash]: %s" (or (plist-get message :command) "")))
+         (_ (format "[%s]" role)))))
+    ("custom_message"
+     (format "[%s]: %s"
+             (or (plist-get entry :customType) "custom")
+             (pi-session--content-text (plist-get entry :content))))
+    ("compaction"
+     (format "[compaction: %dk tokens]"
+             (round (/ (or (plist-get entry :tokensBefore) 0) 1000.0))))
+    ("branch_summary"
+     (format "[branch summary]: %s" (string-trim (or (plist-get entry :summary) ""))))
+    ("label"
+     (format "[label: %s]" (or (plist-get entry :label) "(cleared)")))
+    ("session_info"
+     (if-let* ((name (plist-get entry :name)))
+         (format "[title: %s]" name)
+       "[title: empty]"))
+    (_ (format "[%s]" (plist-get entry :type)))))
+
+(defun pi-session--resolved-label-state (records)
+  (let ((labels (make-hash-table :test #'equal)))
+    (dolist (record records labels)
+      (let* ((entry (plist-get record :entry)))
+        (when (equal (plist-get entry :type) "label")
+          (let ((target-id (plist-get entry :targetId))
+                (label (plist-get entry :label)))
+            (if (and (stringp label) (not (string-empty-p label)))
+                (puthash target-id
+                         (list :label label :timestamp (plist-get entry :timestamp))
+                         labels)
+              (remhash target-id labels))))))))
+
+(defun pi-session--visible-ancestor-id (entry by-id visible-ids)
+  (let ((parent-id (plist-get entry :parentId)))
+    (while (and parent-id (not (gethash parent-id visible-ids)))
+      (setq parent-id (plist-get (gethash parent-id by-id) :parentId)))
+    parent-id))
+
+(defun pi-session--active-visible-entry-id (entries by-id visible-ids)
+  (let ((current-id (and entries (plist-get (car (last entries)) :id))))
+    (while (and current-id (not (gethash current-id visible-ids)))
+      (setq current-id (plist-get (gethash current-id by-id) :parentId)))
+    current-id))
+
+(defun pi-session-tree-nodes (session)
+  "Return a flattened representation of SESSION's conversation tree."
+  (let* ((records (pi-session--session-file-records session))
+         (entries (mapcar (lambda (record) (plist-get record :entry))
+                          (seq-remove (lambda (record)
+                                        (equal (plist-get (plist-get record :entry) :type)
+                                               "session"))
+                                      records)))
+         (labels (pi-session--resolved-label-state records))
+         (by-id (make-hash-table :test #'equal))
+         (visible-ids (make-hash-table :test #'equal))
+         (children (make-hash-table :test #'equal))
+         (contains-active (make-hash-table :test #'equal))
+         (active-path (make-hash-table :test #'equal))
+         roots
+         flat)
+    (dolist (entry entries)
+      (puthash (plist-get entry :id) entry by-id)
+      (when (pi-session--visible-tree-entry-p entry)
+        (puthash (plist-get entry :id) t visible-ids)))
+    (let ((active-id (pi-session--active-visible-entry-id entries by-id visible-ids)))
+      (while active-id
+        (puthash active-id t active-path)
+        (setq active-id (plist-get (gethash active-id by-id) :parentId))))
+    (dolist (entry entries)
+      (when (gethash (plist-get entry :id) visible-ids)
+        (let* ((entry-id (plist-get entry :id))
+               (parent-id (pi-session--visible-ancestor-id entry by-id visible-ids))
+               (bucket (copy-sequence (gethash parent-id children))))
+          (puthash parent-id (append bucket (list entry-id)) children))))
+    (setq roots (copy-sequence (gethash nil children)))
+    (let ((current-id (pi-session--active-visible-entry-id entries by-id visible-ids)))
+      (cl-labels
+          ((contains-active-p (entry-id)
+             (or (gethash entry-id contains-active)
+                 (let* ((child-ids (gethash entry-id children))
+                        (value (or (equal entry-id current-id)
+                                   (seq-some #'contains-active-p child-ids))))
+                   (puthash entry-id value contains-active)
+                   value)))
+           (sort-entry-ids (entry-ids)
+             (sort (copy-sequence entry-ids)
+                   (lambda (left right)
+                     (let ((left-active (contains-active-p left))
+                           (right-active (contains-active-p right)))
+                       (if (eq left-active right-active)
+                           (string-lessp (or (plist-get (gethash left by-id) :timestamp) "")
+                                         (or (plist-get (gethash right by-id) :timestamp) ""))
+                         left-active)))))
+           (tree-prefix (branch-columns show-connector is-last)
+             (concat
+              (mapconcat (lambda (has-more-siblings)
+                           (if has-more-siblings "│  " "   "))
+                         branch-columns
+                         "")
+              (if show-connector
+                  (if is-last "└─ " "├─ ")
+                "")))
+           (visit (entry-id branch-columns show-connector is-last)
+             (let* ((entry (gethash entry-id by-id))
+                    (entry-label (gethash entry-id labels))
+                    (text (pi-session--tree-entry-text entry))
+                    (marker (cond
+                             ((equal entry-id current-id)
+                              (propertize "• " 'face 'font-lock-keyword-face))
+                             ((gethash entry-id active-path) "• ")
+                             (t "◦ ")))
+                    (prefix (tree-prefix branch-columns show-connector is-last))
+                    (label-prefix (if entry-label
+                                      (format "[%s] " (plist-get entry-label :label))
+                                    ""))
+                    (display (concat prefix marker label-prefix text
+                                     (when (equal entry-id current-id)
+                                       " ← active")
+                                     (format " [%s]"
+                                             (substring entry-id 0 (min 8 (length entry-id))))))
+                    (descendant-columns (if show-connector
+                                            (append branch-columns (list (not is-last)))
+                                          branch-columns)))
+               (push (list :id entry-id
+                           :entry entry
+                           :current (equal entry-id current-id)
+                           :display display)
+                     flat)
+               (let* ((raw-children (gethash entry-id children))
+                      (child-ids (sort-entry-ids raw-children))
+                      (count (length child-ids))
+                      (multiple-children (> count 1))
+                      (index 0))
+                 (dolist (child-id child-ids)
+                   (setq index (1+ index))
+                   (visit child-id
+                          descendant-columns
+                          multiple-children
+                          (= index count)))))))
+        (setq roots (sort-entry-ids roots))
+        (let ((count (length roots))
+              (multiple-roots (> (length roots) 1))
+              (index 0))
+          (dolist (entry-id roots)
+            (setq index (1+ index))
+            (visit entry-id nil multiple-roots (= index count))))))
+    (nreverse flat)))
+
+(defun pi-session--generate-entry-id (used-ids)
+  (let (candidate)
+    (while (or (not candidate)
+               (gethash candidate used-ids))
+      (setq candidate (substring (md5 (format "%s%s%s"
+                                              (float-time)
+                                              (random)
+                                              (user-uid)))
+                                 0 8)))
+    (puthash candidate t used-ids)
+    candidate))
+
+(defun pi-session--branch-records-to (target-id by-id record-by-id)
+  (let (records current-id)
+    (setq current-id target-id)
+    (while current-id
+      (let ((record (gethash current-id record-by-id)))
+        (unless record
+          (user-error "pi: session tree entry not found: %s" current-id))
+        (push record records)
+        (setq current-id (plist-get (gethash current-id by-id) :parentId))))
+    records))
+
+(defun pi-session-checkout-tree-entry (session entry-id callback)
+  "Move SESSION to ENTRY-ID and invoke CALLBACK.
+
+This uses a hidden custom entry to move the leaf within the same persisted
+session file because pi RPC does not expose native session-tree navigation."
+  (condition-case err
+      (let* ((records (pi-session--session-file-records session))
+             (entry-records (seq-remove (lambda (record)
+                                          (equal (plist-get (plist-get record :entry) :type)
+                                                 "session"))
+                                        records))
+             (by-id (make-hash-table :test #'equal))
+             (used-ids (make-hash-table :test #'equal))
+             entry
+             branch-target-id
+             editor-text)
+        (dolist (record entry-records)
+          (let ((record-entry (plist-get record :entry))
+                (record-id nil))
+            (setq record-id (plist-get record-entry :id))
+            (puthash record-id record-entry by-id)
+            (puthash record-id t used-ids)))
+        (setq entry (gethash entry-id by-id))
+        (unless entry
+          (user-error "pi: session tree entry not found"))
+        (pcase (plist-get entry :type)
+          ("message"
+           (let* ((message (plist-get entry :message))
+                  (role (plist-get message :role)))
+             (if (equal role "user")
+                 (setq branch-target-id (plist-get entry :parentId)
+                       editor-text (pi-session--message-text message))
+               (setq branch-target-id entry-id))))
+          ("custom_message"
+           (setq branch-target-id (plist-get entry :parentId)
+                 editor-text (pi-session--content-text (plist-get entry :content))))
+          (_
+           (setq branch-target-id entry-id)))
+        (let* ((session-file (pi-session-session-file session))
+               (marker-id (pi-session--generate-entry-id used-ids))
+               (timestamp (format-time-string "%FT%T.%3NZ" (current-time) t))
+               (marker
+                `(("type" . "custom")
+                  ("id" . ,marker-id)
+                  ("parentId" . ,branch-target-id)
+                  ("timestamp" . ,timestamp)
+                  ("customType" . "pi.el/tree")
+                  ("data" . (("entryId" . ,entry-id))))))
+          (unless (and (stringp session-file)
+                       (not (string-empty-p session-file))
+                       (file-writable-p session-file))
+            (user-error "pi: current session file is not writable"))
+          (with-temp-buffer
+            (insert (json-encode marker) "\n")
+            (write-region (point-min) (point-max) session-file t 'silent))
+          (pi-session-restart
+           session
+           (lambda (s response)
+             (let ((data (plist-get response :data)))
+               (when editor-text
+                 (setq data (plist-put data :editor-text editor-text))
+                 (setq response (plist-put response :data data))))
+             (when callback
+               (funcall callback s response))))))
+    (error
+     (when callback
+       (funcall callback
+                session
+                (list :success :json-false
+                      :error (error-message-string err)))))))
 
 (defun pi-session--scope-name (root)
   (let ((name (file-name-nondirectory root)))
@@ -826,7 +1139,7 @@ CALLBACK receives `(SESSION RESPONSE)'."
         (when callback
           (funcall callback session response)))))))
 
-(defun pi-session-restart (session)
+(defun pi-session-restart (session &optional callback)
   "Restart SESSION process and preserve session context."
   (unless session
     (user-error "No pi session selected"))
@@ -835,7 +1148,11 @@ CALLBACK receives `(SESSION RESPONSE)'."
   (pi-session--ensure-running
    session
    (lambda (_session)
-     (message "Restarted pi session: %s" (pi-session-display-name session))))
+     (if callback
+         (funcall callback
+                  session
+                  (list :success t :data (pi-session-cached-state session)))
+       (message "Restarted pi session: %s" (pi-session-display-name session)))))
   session)
 
 (defun pi-session-kill (session &optional silent)
