@@ -18,6 +18,7 @@
 
 (declare-function pi-ui-open-session "pi-ui" (&optional source-buffer))
 (declare-function pi-ui-show-session-buffer "pi-ui" (&optional session source-buffer))
+(declare-function pi-ui-toggle-session-buffer "pi-ui" (session &optional source-buffer))
 (declare-function pi-ui-send-prompt "pi-ui" (source-buffer prompt))
 (declare-function pi-ui-compose-prompt "pi-ui" (&optional source-buffer initial-text))
 
@@ -133,6 +134,20 @@ create a new session for the scope."
            (buffer-live-p pi-ui--source-buffer))
       pi-ui--source-buffer
     (current-buffer)))
+
+(defun pi-toggle-window ()
+  "Toggle the side pi window for the current project.
+
+This command does not create a new pi session. If the current project or
+directory scope has no existing pi session, signal a user error."
+  (interactive)
+  (let* ((source-buffer (pi--tree-source-buffer))
+         (session (or (and (derived-mode-p 'pi-session-buffer-mode)
+                           (bound-and-true-p pi-ui--session))
+                      (pi-session-current-for-buffer source-buffer))))
+    (pi-ui-toggle-session-buffer session source-buffer)))
+
+(define-key pi-command-map (kbd "w") #'pi-toggle-window)
 
 (defun pi--existing-session-for-tree (&optional source-buffer)
   (or (and (derived-mode-p 'pi-session-buffer-mode)

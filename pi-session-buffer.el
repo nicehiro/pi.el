@@ -11,6 +11,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'seq)
 (require 'subr-x)
 (require 'pi-session)
 (require 'pi-prompt)
@@ -24,6 +25,7 @@
 (defvar pi-ui-window-size)
 (defvar pi-ui-auto-scroll)
 (defvar pi-ui-enable-streaming)
+(defvar pi-ui-follow-current-buffer)
 (defvar pi-ui-stream-render-interval)
 (defvar pi-ui-tool-display-style)
 
@@ -32,6 +34,7 @@
 (defvar pi-ui-placeholder-face)
 
 (defvar pi-ui--session-buffers (make-hash-table :test #'equal))
+(defvar pi-ui--follow-current-buffer-last nil)
 
 (defvar-local pi-ui--session nil)
 (defvar-local pi-ui--source-buffer nil)
@@ -144,6 +147,43 @@
     (when (window-live-p window)
       (pi-ui--update-session-header-line buffer))
     window))
+
+(defun pi-ui--session-buffer-window-p (window)
+  (when (window-live-p window)
+    (with-current-buffer (window-buffer window)
+      (derived-mode-p 'pi-session-buffer-mode))))
+
+(defun pi-ui--visible-session-windows (&optional frame)
+  (seq-filter #'pi-ui--session-buffer-window-p
+              (window-list frame 'no-minibuf)))
+
+(defun pi-ui--source-buffer-p (buffer)
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (not (or (minibufferp)
+               (derived-mode-p 'pi-session-buffer-mode)
+               (derived-mode-p 'pi-prompt-buffer-mode))))))
+
+(defun pi-ui--follow-current-buffer ()
+  (when (bound-and-true-p pi-ui-follow-current-buffer)
+    (let* ((window (selected-window))
+           (frame (window-frame window))
+           (source-buffer (window-buffer window)))
+      (when (and (pi-ui--source-buffer-p source-buffer)
+                 (pi-ui--visible-session-windows frame))
+        (let ((session (pi-session-current-for-buffer source-buffer)))
+          (when session
+            (let* ((state (cons frame session))
+                   (target-buffer (pi-ui--ensure-buffer session source-buffer)))
+              (unless (equal state pi-ui--follow-current-buffer-last)
+                (setq pi-ui--follow-current-buffer-last state)
+                (pi-ui--refresh-session-buffer session target-buffer))
+              (dolist (session-window (pi-ui--visible-session-windows frame))
+                (unless (eq (window-buffer session-window) target-buffer)
+                  (set-window-buffer session-window target-buffer))
+                (pi-ui--update-session-header-line target-buffer)))))))))
+
+(add-hook 'post-command-hook #'pi-ui--follow-current-buffer)
 
 (defun pi-ui--window-at-bottom-p (window)
   (with-current-buffer (window-buffer window)
@@ -276,6 +316,24 @@ If SESSION is nil, resolve from SOURCE-BUFFER scope and create on demand."
     (pi-ui--refresh-session-buffer session buffer)
     (pi-ui--display-buffer buffer)
     buffer))
+
+(defun pi-ui-toggle-session-buffer (session &optional source-buffer)
+  "Toggle the side window for SESSION without creating a session."
+  (unless session
+    (user-error "pi: no existing session for this project"))
+  (let* ((buffer (pi-ui--get-buffer session))
+         (windows (and (buffer-live-p buffer)
+                       (get-buffer-window-list buffer nil (selected-frame)))))
+    (if windows
+        (progn
+          (dolist (window windows)
+            (when (window-live-p window)
+              (quit-window nil window)))
+          (message "pi: hid session window"))
+      (setq buffer (pi-ui--ensure-buffer session source-buffer))
+      (pi-ui--refresh-session-buffer session buffer)
+      (pi-ui--display-buffer buffer)
+      buffer)))
 
 (defun pi-ui-open-session (&optional source-buffer)
   "Open and focus SOURCE-BUFFER's scope session buffer."

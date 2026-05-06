@@ -54,6 +54,14 @@ to the latest output during updates."
   "Whether to render incremental assistant deltas while a run is active."
   :type 'boolean)
 
+(defcustom pi-ui-follow-current-buffer t
+  "Whether visible pi session windows follow the selected source buffer.
+
+When non-nil, changing the selected non-pi buffer switches an already visible
+pi session window on the same frame to that buffer's existing scope session,
+if one exists. This never creates a new pi session."
+  :type 'boolean)
+
 (defcustom pi-ui-stream-render-interval 0.05
   "Seconds between live-stream redraws.
 
