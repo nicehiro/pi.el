@@ -54,11 +54,14 @@
   (aref pi-ui--spinner-frames
         (mod pi-ui--spinner-frame-index (length pi-ui--spinner-frames))))
 
-(defun pi-ui--visible-streaming-session-buffer-p (buffer)
+(defun pi-ui--active-session-buffer-p (buffer)
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (and (bound-and-true-p pi-ui--session)
-           (plist-get (pi-session-cached-state pi-ui--session) :is-streaming)
+           (let ((state (pi-session-cached-state pi-ui--session)))
+             (or (plist-get state :is-streaming)
+                 (plist-get state :is-compacting)
+                 (plist-get state :is-retrying)))
            (get-buffer-window buffer t)))))
 
 (defun pi-ui--stop-spinner-timer ()
@@ -68,7 +71,7 @@
         pi-ui--spinner-frame-index 0))
 
 (defun pi-ui--spinner-tick ()
-  (let ((buffers (seq-filter #'pi-ui--visible-streaming-session-buffer-p
+  (let ((buffers (seq-filter #'pi-ui--active-session-buffer-p
                              (buffer-list))))
     (if (null buffers)
         (pi-ui--stop-spinner-timer)
@@ -78,7 +81,7 @@
           (force-mode-line-update))))))
 
 (defun pi-ui--ensure-spinner-timer ()
-  (if (seq-some #'pi-ui--visible-streaming-session-buffer-p (buffer-list))
+  (if (seq-some #'pi-ui--active-session-buffer-p (buffer-list))
       (unless (timerp pi-ui--spinner-timer)
         (setq pi-ui--spinner-timer (run-at-time 0 0.1 #'pi-ui--spinner-tick)))
     (pi-ui--stop-spinner-timer)))
@@ -87,14 +90,27 @@
   (when session
     (let* ((state (pi-session-cached-state session))
            (items nil))
-      (push (if (plist-get state :is-streaming)
-                (format "%s Working" (pi-ui--spinner-frame))
-              "○ Idle")
+      (push (cond
+             ((plist-get state :is-compacting)
+              (format "%s Compacting" (pi-ui--spinner-frame)))
+             ((plist-get state :is-retrying)
+              (format "%s Retrying" (pi-ui--spinner-frame)))
+             ((plist-get state :is-streaming)
+              (format "%s Working" (pi-ui--spinner-frame)))
+             (t "○ Idle"))
             items)
       (when-let* ((model-name (pi-ui--session-model-name session)))
         (push (format "Model: %s" model-name) items))
       (when-let* ((thinking-level (plist-get state :thinking-level)))
         (push (format "Thinking: %s" thinking-level) items))
+      (when-let* ((pending (plist-get state :pending-message-count))
+                  ((numberp pending))
+                  ((> pending 0)))
+        (push (format "Queued: %d" pending) items))
+      (when (eq (plist-get state :auto-compaction-enabled) t)
+        (push "Auto-compact" items))
+      (when (eq (plist-get state :auto-retry-enabled) t)
+        (push "Auto-retry" items))
       (propertize (string-join (nreverse items) " • ")
                   'face 'pi-ui-meta-face))))
 
@@ -332,7 +348,10 @@
                                        (eq (plist-get result :isError) t)
                                        (eq (plist-get result :success) :json-false)))))
     (cond
-     ((or (plist-get event :error) result-error) 'error)
+     ((or (plist-get event :error)
+          (eq (plist-get event :isError) t)
+          result-error)
+      'error)
      (result 'success)
      (t 'unknown))))
 
@@ -380,6 +399,7 @@
                             (pcase status
                               ('success "✓")
                               ('error "✗")
+                              ('running "…")
                               (_ nil))
                             (when-let* ((duration (pi-ui--format-duration-ms duration-ms)))
                               (format "(%s)" duration))))
@@ -401,6 +421,7 @@
             (status-mark (pcase status
                            ('success (propertize "✓" 'face 'pi-ui-tool-success-face))
                            ('error (propertize "✗" 'face 'pi-ui-tool-error-face))
+                           ('running (propertize "…" 'face 'pi-ui-tool-line-face))
                            (_ nil)))
             (duration (when-let* ((formatted (pi-ui--format-duration-ms duration-ms)))
                         (propertize (format "(%s)" formatted) 'face 'pi-ui-tool-line-face))))
@@ -437,6 +458,27 @@
              "\n\n"))
     (_ "")))
 
+(defun pi-ui--render-extension-state (statuses widgets title)
+  (let (lines)
+    (when (and (stringp title) (not (string-empty-p title)))
+      (push (format "Title: %s" title) lines))
+    (dolist (entry (reverse statuses))
+      (let ((key (car entry))
+            (text (cdr entry)))
+        (when (and (stringp text) (not (string-empty-p text)))
+          (push (format "%s: %s" key text) lines))))
+    (dolist (widget (reverse widgets))
+      (pcase-let ((`(,key ,widget-lines ,_placement) widget))
+        (push (format "Widget %s:" key) lines)
+        (dolist (line widget-lines)
+          (push (format "  %s" line) lines))))
+    (if lines
+        (concat (propertize "Extension UI\n" 'face 'pi-ui-meta-face)
+                (propertize (string-join (nreverse lines) "\n")
+                            'face 'pi-ui-meta-face)
+                "\n\n")
+      "")))
+
 (defun pi-ui--render-transient-item (item)
   (pcase (plist-get item :kind)
     ('notify
@@ -448,6 +490,10 @@
              (plist-get item :text)
              "\n\n"))
     ('extension
+     (concat (propertize "> " 'face 'pi-ui-meta-face)
+             (plist-get item :text)
+             "\n\n"))
+    ('status
      (concat (propertize "> " 'face 'pi-ui-meta-face)
              (plist-get item :text)
              "\n\n"))

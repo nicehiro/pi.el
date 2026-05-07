@@ -37,9 +37,14 @@ idle shutdown. If it returns non-nil, the session is kept alive and the idle
 timer is rescheduled."
   :type '(choice (const :tag "None" nil) function))
 
-(defcustom pi-session-agent-directory (expand-file-name "~/.pi/agent")
-  "Base directory used by pi to persist session files."
-  :type 'directory)
+(defcustom pi-session-directory nil
+  "Directory used by pi to persist session files.
+
+When nil, derive the directory from `--session-dir' in `pi-rpc-extra-args',
+then `PI_CODING_AGENT_SESSION_DIR', then pi's default
+`~/.pi/agent/sessions'."
+  :type '(choice (const :tag "Use pi default/configured session dir" nil)
+                 directory))
 
 (defcustom pi-session-active-index-file
   (locate-user-emacs-file "pi-active-sessions.eld")
@@ -138,6 +143,28 @@ transcripts just to show picker labels."
       (pi-session--save-active-index)
       nil))))
 
+(defun pi-session--rpc-session-dir-arg ()
+  "Return `--session-dir' from `pi-rpc-extra-args', if present."
+  (let ((args pi-rpc-extra-args)
+        value)
+    (while args
+      (let ((arg (pop args)))
+        (cond
+         ((equal arg "--session-dir")
+          (setq value (pop args)))
+         ((string-prefix-p "--session-dir=" arg)
+          (setq value (substring arg (length "--session-dir=")))))))
+    value))
+
+(defun pi-session--base-session-directory ()
+  "Return the current pi session storage directory."
+  (file-name-as-directory
+   (expand-file-name
+    (or pi-session-directory
+        (pi-session--rpc-session-dir-arg)
+        (getenv "PI_CODING_AGENT_SESSION_DIR")
+        "~/.pi/agent/sessions"))))
+
 (defun pi-session--session-dir-for-root (root)
   (let* ((normalized-root (pi-session--normalize-dir root))
          (safe-root (format "--%s--"
@@ -145,8 +172,8 @@ transcripts just to show picker labels."
                              "[/\\:]" "-"
                              (replace-regexp-in-string "\\`[/\\]" ""
                                                        normalized-root))))
-         (session-dir (expand-file-name (concat "sessions/" safe-root)
-                                        pi-session-agent-directory)))
+         (session-dir (expand-file-name safe-root
+                                        (pi-session--base-session-directory))))
     (when (file-directory-p session-dir)
       session-dir)))
 
@@ -484,22 +511,14 @@ transcripts just to show picker labels."
     (puthash candidate t used-ids)
     candidate))
 
-(defun pi-session--branch-records-to (target-id by-id record-by-id)
-  (let (records current-id)
-    (setq current-id target-id)
-    (while current-id
-      (let ((record (gethash current-id record-by-id)))
-        (unless record
-          (user-error "pi: session tree entry not found: %s" current-id))
-        (push record records)
-        (setq current-id (plist-get (gethash current-id by-id) :parentId))))
-    records))
-
-(defun pi-session-checkout-tree-entry (session entry-id callback)
+(defun pi-session-navigate-tree (session entry-id callback)
   "Move SESSION to ENTRY-ID and invoke CALLBACK.
 
-This uses a hidden custom entry to move the leaf within the same persisted
-session file because pi RPC does not expose native session-tree navigation."
+Current pi sessions are JSONL trees linked by `id' and `parentId'. RPC mode
+exposes native `fork' and `clone' commands, but not native in-file tree
+navigation yet, so this records a hidden custom leaf marker in the same session
+file. Selecting a user or custom message moves to its parent and returns the
+selected text as `:editor-text', matching current `/tree' behavior."
   (condition-case err
       (let* ((records (pi-session--session-file-records session))
              (entry-records (seq-remove (lambda (record)
@@ -565,6 +584,69 @@ session file because pi RPC does not expose native session-tree navigation."
                 session
                 (list :success :json-false
                       :error (error-message-string err)))))))
+
+(defun pi-session--session-replacement-callback (session response callback)
+  "Refresh SESSION state after RESPONSE from a session-replacing command."
+  (if (or (eq (plist-get response :success) :json-false)
+          (plist-get (plist-get response :data) :cancelled))
+      (when callback
+        (funcall callback session response))
+    (pi-session--request-state
+     session
+     (lambda (_s _state state-response)
+       (when callback
+         (funcall callback session
+                  (if (eq (plist-get state-response :success) :json-false)
+                      state-response
+                    response)))))))
+
+(defun pi-session-get-fork-messages (session callback)
+  "Load user messages available for current RPC `fork' in SESSION."
+  (unless session
+    (user-error "No pi session selected"))
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      '(("type" . "get_fork_messages"))
+      (lambda (response)
+        (when callback
+          (funcall callback session response)))))))
+
+(defun pi-session-fork (session entry-id &optional callback)
+  "Fork SESSION from user message ENTRY-ID using current RPC `fork'.
+
+CALLBACK receives `(SESSION RESPONSE)'. On success, RESPONSE data includes the
+selected message text in `:text'."
+  (unless session
+    (user-error "No pi session selected"))
+  (unless (and (stringp entry-id) (not (string-empty-p entry-id)))
+    (user-error "pi: missing fork entry id"))
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      `(("type" . "fork")
+        ("entryId" . ,entry-id))
+      (lambda (response)
+        (pi-session--session-replacement-callback session response callback))))))
+
+(defun pi-session-clone (session &optional callback)
+  "Clone SESSION's current active branch using current RPC `clone'.
+
+CALLBACK receives `(SESSION RESPONSE)'."
+  (unless session
+    (user-error "No pi session selected"))
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      '(("type" . "clone"))
+      (lambda (response)
+        (pi-session--session-replacement-callback session response callback))))))
 
 (defun pi-session--scope-name (root)
   (let ((name (file-name-nondirectory root)))
@@ -633,6 +715,43 @@ The plist keys are :kind, :root, :name, and :key."
   (setf (pi-session-cached-state session)
         (plist-put (pi-session-cached-state session) :is-streaming value)))
 
+(defun pi-session--apply-queue-update (session event)
+  "Update SESSION cached queue state from a current RPC queue_update EVENT."
+  (let* ((steering (or (plist-get event :steering) nil))
+         (follow-up (or (plist-get event :followUp) nil))
+         (pending (+ (length steering) (length follow-up)))
+         (state (pi-session-cached-state session)))
+    (setq state (plist-put state :steering-queue steering))
+    (setq state (plist-put state :follow-up-queue follow-up))
+    (setq state (plist-put state :pending-message-count pending))
+    (setf (pi-session-cached-state session) state)))
+
+(defun pi-session--apply-compaction-event (session event)
+  "Update SESSION cached compaction state from EVENT."
+  (let ((state (pi-session-cached-state session)))
+    (pcase (plist-get event :type)
+      ("compaction_start"
+       (setq state (plist-put state :is-compacting t))
+       (setq state (plist-put state :compaction-reason (plist-get event :reason))))
+      ("compaction_end"
+       (setq state (plist-put state :is-compacting nil))
+       (setq state (plist-put state :compaction-reason nil))))
+    (setf (pi-session-cached-state session) state)))
+
+(defun pi-session--apply-retry-event (session event)
+  "Update SESSION cached auto-retry state from EVENT."
+  (let ((state (pi-session-cached-state session)))
+    (pcase (plist-get event :type)
+      ("auto_retry_start"
+       (setq state (plist-put state :is-retrying t))
+       (setq state (plist-put state :retry-attempt (plist-get event :attempt)))
+       (setq state (plist-put state :retry-max-attempts (plist-get event :maxAttempts))))
+      ("auto_retry_end"
+       (setq state (plist-put state :is-retrying nil))
+       (setq state (plist-put state :retry-attempt nil))
+       (setq state (plist-put state :retry-max-attempts nil))))
+    (setf (pi-session-cached-state session) state)))
+
 (defun pi-session--should-keepalive-p (session)
   (and pi-session-keepalive-predicate
        (funcall pi-session-keepalive-predicate session)))
@@ -656,6 +775,11 @@ The plist keys are :kind, :root, :name, and :key."
   (pcase (plist-get event :type)
     ("agent_start" (pi-session--set-streaming session t))
     ("agent_end" (pi-session--set-streaming session nil))
+    ("queue_update" (pi-session--apply-queue-update session event))
+    ((or "compaction_start" "compaction_end")
+     (pi-session--apply-compaction-event session event))
+    ((or "auto_retry_start" "auto_retry_end")
+     (pi-session--apply-retry-event session event))
     (_ nil))
   (pi-session--touch session)
   (run-hook-with-args 'pi-session-event-hook session event))
@@ -686,7 +810,22 @@ The plist keys are :kind, :root, :name, and :key."
           :last-refresh-at (float-time))))
 
 (defun pi-session--apply-state (session response)
-  (let ((state (pi-session--state-from-response response)))
+  (let* ((data (plist-get response :data))
+         (previous-state (pi-session-cached-state session))
+         (state (pi-session--state-from-response response)))
+    (dolist (entry '((:auto-retry-enabled . :autoRetryEnabled)
+                     (:is-retrying . :isRetrying)
+                     (:retry-attempt . :retryAttempt)
+                     (:retry-max-attempts . :retryMaxAttempts)))
+      (let ((state-key (car entry))
+            (data-key (cdr entry)))
+        (setq state
+              (cond
+               ((plist-member data data-key)
+                (plist-put state state-key (plist-get data data-key)))
+               ((plist-member previous-state state-key)
+                (plist-put state state-key (plist-get previous-state state-key)))
+               (t state)))))
     (setf (pi-session-cached-state session) state
           (pi-session-session-file session) (plist-get state :session-file)
           (pi-session-session-id session) (plist-get state :session-id))
@@ -838,31 +977,43 @@ as the initial session file to resume."
           session)
       (pi-session--create-for-scope scope session-file))))
 
-(defun pi-session-send-prompt (session message &optional callback)
-  "Send MESSAGE through SESSION.
-CALLBACK receives `(SESSION RESPONSE)'."
+(defun pi-session--send-message-command (session command-type message &optional callback)
+  "Send MESSAGE to SESSION using current RPC COMMAND-TYPE."
   (unless session
     (user-error "No pi session selected"))
   (pi-session--ensure-running
    session
    (lambda (_session)
      (pi-session--touch session)
-     (let ((command (if (pi-session--streaming-p session)
-                        `(("type" . "prompt")
-                          ("message" . ,message)
-                          ("streamingBehavior" . "followUp"))
-                      `(("type" . "prompt")
-                        ("message" . ,message)))))
-       (pi-rpc-send
-        (pi-session-rpc session)
-        command
-        (lambda (response)
-          (when (eq (plist-get response :success) :json-false)
-            (run-hook-with-args 'pi-session-event-hook session
-                                (list :type "session_error"
-                                      :error (plist-get response :error))))
-          (when callback
-            (funcall callback session response))))))))
+     (pi-rpc-send
+      (pi-session-rpc session)
+      `(("type" . ,command-type)
+        ("message" . ,message))
+      (lambda (response)
+        (when (eq (plist-get response :success) :json-false)
+          (run-hook-with-args 'pi-session-event-hook session
+                              (list :type "session_error"
+                                    :error (plist-get response :error))))
+        (when callback
+          (funcall callback session response)))))))
+
+(defun pi-session-send-prompt (session message &optional callback)
+  "Send MESSAGE through SESSION.
+Idle sends use current RPC `prompt`; streaming sends queue a `follow_up`.
+CALLBACK receives `(SESSION RESPONSE)'."
+  (pi-session--send-message-command
+   session
+   (if (pi-session--streaming-p session) "follow_up" "prompt")
+   message
+   callback))
+
+(defun pi-session-send-steer (session message &optional callback)
+  "Queue MESSAGE as current RPC `steer` in SESSION."
+  (pi-session--send-message-command session "steer" message callback))
+
+(defun pi-session-send-follow-up (session message &optional callback)
+  "Queue MESSAGE as current RPC `follow_up` in SESSION."
+  (pi-session--send-message-command session "follow_up" message callback))
 
 (defun pi-session--normalize-extension-ui-payload (payload)
   "Normalize PAYLOAD for an extension UI response."
@@ -1039,6 +1190,105 @@ CALLBACK receives `(SESSION RESPONSE)'."
         (lambda (response)
           (when callback
             (funcall callback session response))))))))
+
+(defun pi-session-set-queue-mode (session command-type state-key mode &optional callback)
+  "Set SESSION queue mode using COMMAND-TYPE, cache STATE-KEY as MODE."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      `(("type" . ,command-type)
+        ("mode" . ,mode))
+      (lambda (response)
+        (if (eq (plist-get response :success) :json-false)
+            (when callback
+              (funcall callback session response))
+          (setf (pi-session-cached-state session)
+                (plist-put (pi-session-cached-state session) state-key mode))
+          (when callback
+            (funcall callback session response))))))))
+
+(defun pi-session-set-steering-mode (session mode &optional callback)
+  "Set SESSION steering queue MODE."
+  (pi-session-set-queue-mode session "set_steering_mode" :steering-mode mode callback))
+
+(defun pi-session-set-follow-up-mode (session mode &optional callback)
+  "Set SESSION follow-up queue MODE."
+  (pi-session-set-queue-mode session "set_follow_up_mode" :follow-up-mode mode callback))
+
+(defun pi-session-set-auto-compaction (session enabled &optional callback)
+  "Set SESSION automatic compaction to ENABLED."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      `(("type" . "set_auto_compaction")
+        ("enabled" . ,(if enabled t :json-false)))
+      (lambda (response)
+        (if (eq (plist-get response :success) :json-false)
+            (when callback
+              (funcall callback session response))
+          (pi-session--request-state
+           session
+           (lambda (_s _state _state-response)
+             (when callback
+               (funcall callback session response))))))))))
+
+(defun pi-session-set-auto-retry (session enabled &optional callback)
+  "Set SESSION automatic retry to ENABLED."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      `(("type" . "set_auto_retry")
+        ("enabled" . ,(if enabled t :json-false)))
+      (lambda (response)
+        (unless (eq (plist-get response :success) :json-false)
+          (setf (pi-session-cached-state session)
+                (plist-put (pi-session-cached-state session)
+                           :auto-retry-enabled
+                           (if enabled t nil))))
+        (when callback
+          (funcall callback session response)))))))
+
+(defun pi-session-abort-retry (session &optional callback)
+  "Abort SESSION's in-progress automatic retry delay."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      '(("type" . "abort_retry"))
+      (lambda (response)
+        (when callback
+          (funcall callback session response)))))))
+
+(defun pi-session-get-session-stats (session callback)
+  "Load current RPC session stats for SESSION."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      '(("type" . "get_session_stats"))
+      (lambda (response)
+        (when callback
+          (funcall callback session response)))))))
+
+(defun pi-session-get-last-assistant-text (session callback)
+  "Load the last assistant text for SESSION."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      '(("type" . "get_last_assistant_text"))
+      (lambda (response)
+        (when callback
+          (funcall callback session response)))))))
 
 (defun pi-session-export-html (session &optional output-path callback)
   "Export SESSION to HTML, optionally writing to OUTPUT-PATH."

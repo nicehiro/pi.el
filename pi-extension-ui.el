@@ -14,7 +14,11 @@
 (require 'pi-session)
 
 (declare-function pi-ui--append-transient "pi-session-buffer" (buffer item))
+(declare-function pi-ui--set-extension-status "pi-session-buffer" (buffer key text))
+(declare-function pi-ui--set-extension-widget "pi-session-buffer" (buffer key lines placement &optional clear))
+(declare-function pi-ui--set-extension-title "pi-session-buffer" (buffer title))
 (declare-function pi-ui--display-prompt-buffer "pi-prompt" (buffer))
+(declare-function pi-ui-compose-prompt "pi-prompt" (&optional source-buffer initial-text))
 
 (defvar pi-ui--extension-ui-request-queue nil)
 (defvar pi-ui--extension-ui-request-active nil)
@@ -60,21 +64,6 @@
      (format "Input requested: %s" (or (plist-get event :title) "Enter a value")))
     ("editor"
      (format "Editor requested: %s" (or (plist-get event :title) "Edit text")))
-    ("setStatus"
-     (format "Status %s: %s"
-             (or (plist-get event :statusKey) "")
-             (or (plist-get event :statusText) "")))
-    ("setWidget"
-     (let ((lines (plist-get event :widgetLines)))
-       (format "Widget %s%s"
-               (or (plist-get event :widgetKey) "")
-               (if (and (listp lines) lines)
-                   (concat "\n" (string-join lines "\n"))
-                 ""))))
-    ("setTitle"
-     (format "Title set to: %s" (or (plist-get event :title) "")))
-    ("set_editor_text"
-     "Extension requested editor text update")
     (_ nil)))
 
 (defun pi-ui--enqueue-extension-ui-request (session buffer event)
@@ -129,16 +118,15 @@
                                        (format " — %s" message)
                                      ""))))))
                     (pi-ui--send-extension-ui-response
-                     session request-id `(("confirmed" . ,confirmed)))))
+                     session request-id
+                     `(("confirmed" . ,(if confirmed t :json-false))))))
                  ("input"
                   (let ((value (read-string (format "%s: " title)
                                             nil nil
                                             (or (plist-get event :placeholder) ""))))
                     (pi-ui--send-extension-ui-response
                      session request-id `(("value" . ,value)))))
-                 (_
-                  (pi-ui--send-extension-ui-response
-                   session request-id '(("cancelled" . t)))))
+                 (_ nil))
              (quit
               (pi-ui--send-extension-ui-response
                session request-id '(("cancelled" . t))))
@@ -199,17 +187,38 @@
         (select-window window)))
     buffer))
 
+(defun pi-ui--extension-ui-source-buffer (buffer)
+  (and (buffer-live-p buffer)
+       (buffer-local-value 'pi-ui--source-buffer buffer)))
+
 (defun pi-ui--handle-extension-ui-event (session buffer event)
   (pcase (plist-get event :method)
     ("notify"
      (pi-ui--append-transient
       buffer
-      (list :kind 'notify :text (or (plist-get event :message) ""))))
+      (list :kind 'notify
+            :notify-type (or (plist-get event :notifyType) "info")
+            :text (or (plist-get event :message) ""))))
     ((or "select" "confirm" "input" "editor")
      (pi-ui--enqueue-extension-ui-request session buffer event))
-    ((or "setStatus" "setWidget" "setTitle" "set_editor_text")
-     (when-let* ((note (pi-ui--extension-ui-request-note event)))
-       (pi-ui--append-transient buffer (list :kind 'extension :text note))))
+    ("setStatus"
+     (pi-ui--set-extension-status
+      buffer
+      (plist-get event :statusKey)
+      (plist-get event :statusText)))
+    ("setWidget"
+     (let ((lines (plist-get event :widgetLines)))
+       (pi-ui--set-extension-widget
+        buffer
+        (plist-get event :widgetKey)
+        lines
+        (or (plist-get event :widgetPlacement) "aboveEditor")
+        (not (plist-member event :widgetLines)))))
+    ("setTitle"
+     (pi-ui--set-extension-title buffer (plist-get event :title)))
+    ("set_editor_text"
+     (when-let* ((source-buffer (pi-ui--extension-ui-source-buffer buffer)))
+       (pi-ui-compose-prompt source-buffer (or (plist-get event :text) ""))))
     (_ nil)))
 
 (provide 'pi-extension-ui)

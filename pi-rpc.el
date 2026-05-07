@@ -30,6 +30,12 @@
   "Whether to create an internal process buffer for each RPC subprocess."
   :type 'boolean)
 
+(defconst pi-rpc-minimum-pi-version "0.73.0"
+  "Minimum supported pi coding agent version.")
+
+(defvar pi-rpc--version-check-cache nil
+  "Cached successful pi version checks.")
+
 (cl-defstruct (pi-rpc
                (:constructor pi-rpc--create)
                (:copier nil))
@@ -51,6 +57,31 @@
   "Create the internal process buffer for NAME if enabled."
   (when pi-rpc-debug-buffer
     (generate-new-buffer (format " *pi-rpc:%s*" name))))
+
+(defun pi-rpc--version-from-output (output)
+  "Extract a semantic version from pi --version OUTPUT."
+  (when (string-match "[0-9]+\\(?:\\.[0-9]+\\)\\{2,\\}" output)
+    (match-string 0 output)))
+
+(defun pi-rpc-check-version (&optional executable)
+  "Signal an error unless EXECUTABLE is a supported pi binary."
+  (let* ((executable (or executable pi-rpc-executable))
+         (cached (assoc executable pi-rpc--version-check-cache)))
+    (or (cdr cached)
+        (let ((version
+               (with-temp-buffer
+                 (let ((exit-code (call-process executable nil t nil "--version")))
+                   (unless (zerop exit-code)
+                     (error "pi executable failed version check: %s --version exited with %s"
+                            executable exit-code))
+                   (pi-rpc--version-from-output (string-trim (buffer-string)))))))
+          (unless version
+            (error "pi executable returned an unrecognized version: %s" executable))
+          (when (version< version pi-rpc-minimum-pi-version)
+            (error "pi %s is too old; pi.el requires pi >= %s"
+                   version pi-rpc-minimum-pi-version))
+          (push (cons executable version) pi-rpc--version-check-cache)
+          version))))
 
 (defun pi-rpc--normalize-command (command)
   "Convert COMMAND into a JSON object alist.
@@ -87,65 +118,36 @@ COMMAND may be an alist or plist."
   (when fn
     (apply fn args)))
 
-(defun pi-rpc--strip-leading-terminal-noise (line)
-  "Strip leading terminal control sequences from LINE."
-  (let ((result line)
-        (changed t))
-    (while changed
-      (setq changed nil)
-      ;; OSC ... BEL or ESC \
-      (when (string-match (rx string-start "\e]" (*? anything) (or "\a" "\e\\")) result)
-        (setq result (substring result (match-end 0)))
-        (setq changed t))
-      ;; CSI sequence
-      (when (string-match (rx string-start "\e[" (* (any "0-9:;<=>?")) (* (any " -/")) (any "@-~")) result)
-        (setq result (substring result (match-end 0)))
-        (setq changed t))
-      ;; Other stray control chars before payload
-      (when (string-match (rx string-start (+ (any "\r\n\t\f\v"))) result)
-        (setq result (substring result (match-end 0)))
-        (setq changed t)))
-    result))
-
 (defun pi-rpc--flush-line (rpc line)
   "Handle one decoded JSONL LINE for RPC."
-  (let ((clean-line (pi-rpc--strip-leading-terminal-noise line)))
-    (if (not (string-prefix-p "{" clean-line))
-        (pi-rpc--call-handler
-         (pi-rpc-event-handler rpc)
-         rpc
-         (list :type "rpc_output"
-               :line line
-               :clean-line clean-line))
-      (condition-case err
-          (let* ((json-object-type 'plist)
-                 (json-array-type 'list)
-                 (json-false :json-false)
-                 (json-null nil)
-                 (payload (json-parse-string clean-line :object-type 'plist :array-type 'list
-                                             :false-object :json-false :null-object nil))
-                 (type (plist-get payload :type)))
-            (if (equal type "response")
-                (let* ((id (plist-get payload :id))
-                       (pending (and id (gethash id (pi-rpc-pending-by-id rpc)))))
-                  (when id
-                    (remhash id (pi-rpc-pending-by-id rpc)))
-                  (if pending
-                      (funcall pending payload)
-                    (pi-rpc--call-handler
-                     (pi-rpc-event-handler rpc)
-                     rpc
-                     (list :type "rpc_unmatched_response"
-                           :payload payload))))
-              (pi-rpc--call-handler (pi-rpc-event-handler rpc) rpc payload)))
-        (error
-         (pi-rpc--call-handler
-          (pi-rpc-event-handler rpc)
-          rpc
-          (list :type "rpc_parse_error"
-                :error (error-message-string err)
-                :line line
-                :clean-line clean-line)))))))
+  (condition-case err
+      (let* ((json-object-type 'plist)
+             (json-array-type 'list)
+             (json-false :json-false)
+             (json-null nil)
+             (payload (json-parse-string line :object-type 'plist :array-type 'list
+                                         :false-object :json-false :null-object nil))
+             (type (plist-get payload :type)))
+        (if (equal type "response")
+            (let* ((id (plist-get payload :id))
+                   (pending (and id (gethash id (pi-rpc-pending-by-id rpc)))))
+              (when id
+                (remhash id (pi-rpc-pending-by-id rpc)))
+              (if pending
+                  (funcall pending payload)
+                (pi-rpc--call-handler
+                 (pi-rpc-event-handler rpc)
+                 rpc
+                 (list :type "rpc_unmatched_response"
+                       :payload payload))))
+          (pi-rpc--call-handler (pi-rpc-event-handler rpc) rpc payload)))
+    (error
+     (pi-rpc--call-handler
+      (pi-rpc-event-handler rpc)
+      rpc
+      (list :type "rpc_parse_error"
+            :error (error-message-string err)
+            :line line)))))
 
 (defun pi-rpc--process-filter (process chunk)
   "Process filter for pi RPC PROCESS receiving CHUNK."
@@ -193,6 +195,7 @@ COMMAND may be an alist or plist."
 NAME is used for the internal process and buffer names.
 ON-EVENT receives (RPC EVENT).
 ON-EXIT receives (RPC EVENT)."
+  (pi-rpc-check-version)
   (let* ((default-directory (file-name-as-directory (expand-file-name cwd)))
          (buffer (pi-rpc--make-process-buffer (or name "default")))
          (rpc (pi-rpc--create
@@ -232,7 +235,9 @@ ON-EXIT receives (RPC EVENT)."
 
 (defun pi-rpc-send (rpc command callback)
   "Send COMMAND over RPC and invoke CALLBACK with the decoded response.
-COMMAND may be a plist or alist.  Returns the generated request id."
+The response means pi accepted, queued, or handled COMMAND; agent work may
+continue asynchronously through events. COMMAND may be a plist or alist.
+Returns the generated request id."
   (unless (pi-rpc-live-p rpc)
     (error "RPC process is not running"))
   (let* ((id (pi-rpc--generate-id rpc))

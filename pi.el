@@ -27,14 +27,26 @@
 (declare-function pi-session-resume "pi-session" (session session-file &optional callback))
 (declare-function pi-session-saved-sessions-for-buffer "pi-session" (&optional buffer))
 (declare-function pi-session-tree-nodes "pi-session" (session))
-(declare-function pi-session-checkout-tree-entry "pi-session" (session entry-id callback))
+(declare-function pi-session-navigate-tree "pi-session" (session entry-id callback))
+(declare-function pi-session-get-fork-messages "pi-session" (session callback))
+(declare-function pi-session-fork "pi-session" (session entry-id &optional callback))
+(declare-function pi-session-clone "pi-session" (session &optional callback))
 (declare-function pi-session-get-available-models "pi-session" (session callback))
 (declare-function pi-session-compact "pi-session" (session &optional custom-instructions callback))
+(declare-function pi-session-set-steering-mode "pi-session" (session mode &optional callback))
+(declare-function pi-session-set-follow-up-mode "pi-session" (session mode &optional callback))
+(declare-function pi-session-set-auto-compaction "pi-session" (session enabled &optional callback))
+(declare-function pi-session-set-auto-retry "pi-session" (session enabled &optional callback))
+(declare-function pi-session-abort-retry "pi-session" (session &optional callback))
+(declare-function pi-session-get-session-stats "pi-session" (session callback))
+(declare-function pi-session-get-last-assistant-text "pi-session" (session callback))
 (declare-function pi-session-export-html "pi-session" (session &optional output-path callback))
 (declare-function pi-session-set-model "pi-session" (session provider model-id &optional callback))
 (declare-function pi-session-cycle-model "pi-session" (session &optional callback))
 (declare-function pi-session-set-thinking-level "pi-session" (session level &optional callback))
 (declare-function pi-session-cycle-thinking-level "pi-session" (session &optional callback))
+(declare-function pi-session-send-steer "pi-session" (session message &optional callback))
+(declare-function pi-session-send-follow-up "pi-session" (session message &optional callback))
 (declare-function pi-session-restart "pi-session" (session))
 
 (defvar pi-ui--session)
@@ -46,15 +58,40 @@
 
 (defconst pi-thinking-levels
   '("off" "minimal" "low" "medium" "high" "xhigh")
-  "Supported thinking levels for pi.")
+  "Display order for pi thinking levels.")
+
+(defconst pi-queue-modes '("all" "one-at-a-time")
+  "Current pi RPC queue modes.")
+
+(defun pi--thinking-level-supported-p (model level)
+  "Return non-nil when MODEL supports thinking LEVEL."
+  (let* ((level-map (plist-get model :thinkingLevelMap))
+         (key (intern (concat ":" level)))
+         (value (and (listp level-map)
+                     (plist-member level-map key)
+                     (plist-get level-map key))))
+    (and value (not (eq value :json-false)))))
+
+(defun pi--supported-thinking-levels (model)
+  "Return current pi thinking levels supported by MODEL."
+  (seq-filter (lambda (level)
+                (pi--thinking-level-supported-p model level))
+              pi-thinking-levels))
 
 (defvar pi-command-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "o") #'pi)
     (define-key map (kbd "p") #'pi-prompt)
+    (define-key map (kbd "S") #'pi-steer)
+    (define-key map (kbd "F") #'pi-follow-up)
     (define-key map (kbd "n") #'pi-new-session)
     (define-key map (kbd "R") #'pi-resume-session)
+    (define-key map (kbd "f") #'pi-fork-session)
+    (define-key map (kbd "C") #'pi-clone-session)
     (define-key map (kbd "c") #'pi-compact-session)
+    (define-key map (kbd "A") #'pi-toggle-auto-compaction)
+    (define-key map (kbd "M-r") #'pi-toggle-auto-retry)
+    (define-key map (kbd "M-a") #'pi-abort-retry)
     (define-key map (kbd "a") #'pi-abort)
     (define-key map (kbd "e") #'pi-export-session-html)
     (define-key map (kbd "j") #'pi-tree)
@@ -82,6 +119,13 @@ create a new session for the scope."
   (let ((session (pi-session-ensure-for-buffer source-buffer session-file)))
     (pi-ui-show-session-buffer session source-buffer)
     session))
+
+(defun pi--source-buffer ()
+  "Return the user source buffer for current pi commands."
+  (if (and (derived-mode-p 'pi-session-buffer-mode)
+           (buffer-live-p pi-ui--source-buffer))
+      pi-ui--source-buffer
+    (current-buffer)))
 
 (defun pi--model-ref (model)
   (when model
@@ -130,10 +174,7 @@ create a new session for the scope."
             short-id)))
 
 (defun pi--tree-source-buffer ()
-  (if (and (derived-mode-p 'pi-session-buffer-mode)
-           (buffer-live-p pi-ui--source-buffer))
-      pi-ui--source-buffer
-    (current-buffer)))
+  (pi--source-buffer))
 
 (defun pi-toggle-window ()
   "Toggle the side pi window for the current project.
@@ -187,7 +228,7 @@ directory scope has no existing pi session, signal a user error."
         (if (and (plist-get node :current)
                  (not (pi--tree-node-reeditable-p node)))
             (message "pi: already at this point")
-          (pi-session-checkout-tree-entry
+          (pi-session-navigate-tree
            session
            (plist-get node :id)
            (lambda (s response)
@@ -208,6 +249,38 @@ directory scope has no existing pi session, signal a user error."
   "Compose and send a prompt to the current buffer scope session."
   (interactive)
   (pi-ui-compose-prompt (current-buffer)))
+
+(defun pi--read-message (prompt)
+  (let ((message (read-string prompt)))
+    (when (string-empty-p (string-trim message))
+      (user-error "pi: empty message"))
+    message))
+
+(defun pi-steer (message)
+  "Queue MESSAGE as a steering instruction for the current session."
+  (interactive (list (pi--read-message "Steer pi: ")))
+  (let* ((source-buffer (pi--source-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-send-steer
+     session message
+     (lambda (_s response)
+       (if (pi--rpc-success-p response)
+           (message "pi: queued steering message")
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to queue steering message")))))))
+
+(defun pi-follow-up (message)
+  "Queue MESSAGE as a follow-up for the current session."
+  (interactive (list (pi--read-message "Follow up after pi finishes: ")))
+  (let* ((source-buffer (pi--source-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-send-follow-up
+     session message
+     (lambda (_s response)
+       (if (pi--rpc-success-p response)
+           (message "pi: queued follow-up message")
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to queue follow-up message")))))))
 
 (defun pi-resume-session ()
   "Select and resume a saved session for the current buffer scope."
@@ -264,6 +337,75 @@ directory scope has no existing pi session, signal a user error."
          (message "pi: %s" (or (plist-get response :error)
                                "Failed to start a new session")))))))
 
+(defun pi--fork-message-label (message)
+  (let* ((entry-id (or (plist-get message :entryId) ""))
+         (text (string-trim (or (plist-get message :text) "")))
+         (preview (replace-regexp-in-string "[\n\r\t ]+" " " text))
+         (short-id (substring entry-id 0 (min 8 (length entry-id)))))
+    (format "user: %s [%s]" preview short-id)))
+
+(defun pi-fork-session ()
+  "Fork the current session from a previous user message.
+
+The selected prompt is restored into the composer for editing, matching pi's
+current RPC `fork' behavior."
+  (interactive)
+  (let* ((source-buffer (current-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-get-fork-messages
+     session
+     (lambda (s response)
+       (if (not (pi--rpc-success-p response))
+           (message "pi: %s" (or (plist-get response :error)
+                                 "Failed to load fork messages"))
+         (let* ((messages (plist-get (plist-get response :data) :messages))
+                (choices (mapcar (lambda (message)
+                                   (cons (pi--fork-message-label message) message))
+                                 messages)))
+           (if (null choices)
+               (message "pi: no user messages available to fork")
+             (let* ((selection (let ((completion-extra-properties
+                                      '(:display-sort-function identity
+                                        :cycle-sort-function identity)))
+                                 (completing-read "Fork from message: "
+                                                  (mapcar #'car choices)
+                                                  nil t)))
+                    (message-info (cdr (assoc selection choices)))
+                    (entry-id (plist-get message-info :entryId)))
+               (pi-session-fork
+                s entry-id
+                (lambda (forked response2)
+                  (cond
+                   ((not (pi--rpc-success-p response2))
+                    (message "pi: %s" (or (plist-get response2 :error)
+                                          "Failed to fork session")))
+                   ((plist-get (plist-get response2 :data) :cancelled)
+                    (message "pi: fork cancelled"))
+                   (t
+                    (let ((text (plist-get (plist-get response2 :data) :text)))
+                      (pi-ui-show-session-buffer forked source-buffer)
+                      (message "pi: forked session; edit the prompt to continue")
+                      (when (and (stringp text) (not (string-empty-p text)))
+                        (pi-ui-compose-prompt source-buffer text)))))))))))))))
+
+(defun pi-clone-session ()
+  "Duplicate the current active branch into a new session file."
+  (interactive)
+  (let* ((source-buffer (current-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-clone
+     session
+     (lambda (s response)
+       (cond
+        ((not (pi--rpc-success-p response))
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to clone session")))
+        ((plist-get (plist-get response :data) :cancelled)
+         (message "pi: clone cancelled"))
+        (t
+         (pi-ui-show-session-buffer s source-buffer)
+         (message "pi: cloned current branch into a new session")))))))
+
 (defun pi-compact-session (instructions)
   "Compact the current session context.
 With optional INSTRUCTIONS, pass custom compaction guidance."
@@ -281,6 +423,112 @@ With optional INSTRUCTIONS, pass custom compaction guidance."
          (message "pi: %s" (or (plist-get response :error)
                                "Failed to compact session")))))))
 
+(defun pi-toggle-auto-compaction ()
+  "Toggle automatic compaction for the current session."
+  (interactive)
+  (let* ((source-buffer (pi--source-buffer))
+         (session (pi--ensure-session source-buffer))
+         (enabled (not (eq (plist-get (pi-session-cached-state session)
+                                      :auto-compaction-enabled)
+                          t))))
+    (pi-session-set-auto-compaction
+     session enabled
+     (lambda (_s response)
+       (if (pi--rpc-success-p response)
+           (message "pi: auto-compaction %s" (if enabled "enabled" "disabled"))
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to update auto-compaction")))))))
+
+(defun pi--read-queue-mode (session state-key label)
+  (let ((current (plist-get (pi-session-cached-state session) state-key)))
+    (completing-read
+     (if current
+         (format "%s mode (current %s): " label current)
+       (format "%s mode: " label))
+     pi-queue-modes nil t nil nil
+     (and (member current pi-queue-modes) current))))
+
+(defun pi-set-steering-mode (mode)
+  "Set how queued steering messages are delivered."
+  (interactive
+   (let* ((source-buffer (pi--source-buffer))
+          (session (pi--ensure-session source-buffer)))
+     (list (pi--read-queue-mode session :steering-mode "Steering"))))
+  (let* ((source-buffer (pi--source-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-set-steering-mode
+     session mode
+     (lambda (_s response)
+       (if (pi--rpc-success-p response)
+           (message "pi: steering mode set to %s" mode)
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to set steering mode")))))))
+
+(defun pi-set-follow-up-mode (mode)
+  "Set how queued follow-up messages are delivered."
+  (interactive
+   (let* ((source-buffer (pi--source-buffer))
+          (session (pi--ensure-session source-buffer)))
+     (list (pi--read-queue-mode session :follow-up-mode "Follow-up"))))
+  (let* ((source-buffer (pi--source-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-set-follow-up-mode
+     session mode
+     (lambda (_s response)
+       (if (pi--rpc-success-p response)
+           (message "pi: follow-up mode set to %s" mode)
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to set follow-up mode")))))))
+
+(defun pi-set-auto-retry (enabled)
+  "Enable or disable automatic retry for the current session."
+  (interactive
+   (let* ((source-buffer (pi--source-buffer))
+          (session (pi--ensure-session source-buffer))
+          (current (eq (plist-get (pi-session-cached-state session)
+                                  :auto-retry-enabled)
+                       t)))
+     (list (y-or-n-p (format "Enable auto-retry? (currently %s) "
+                             (if current "enabled" "disabled"))))))
+  (let* ((source-buffer (pi--source-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-set-auto-retry
+     session enabled
+     (lambda (_s response)
+       (if (pi--rpc-success-p response)
+           (message "pi: auto-retry %s" (if enabled "enabled" "disabled"))
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to update auto-retry")))))))
+
+(defun pi-toggle-auto-retry ()
+  "Toggle automatic retry for the current session."
+  (interactive)
+  (let* ((source-buffer (pi--source-buffer))
+         (session (pi--ensure-session source-buffer))
+         (enabled (not (eq (plist-get (pi-session-cached-state session)
+                                      :auto-retry-enabled)
+                          t))))
+    (pi-session-set-auto-retry
+     session enabled
+     (lambda (_s response)
+       (if (pi--rpc-success-p response)
+           (message "pi: auto-retry %s" (if enabled "enabled" "disabled"))
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to update auto-retry")))))))
+
+(defun pi-abort-retry ()
+  "Abort the current automatic retry delay."
+  (interactive)
+  (let* ((source-buffer (pi--source-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-abort-retry
+     session
+     (lambda (_s response)
+       (if (pi--rpc-success-p response)
+           (message "pi: aborted auto-retry")
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to abort auto-retry")))))))
+
 (defun pi-abort ()
   "Abort the current run for the active session."
   (interactive)
@@ -293,6 +541,65 @@ With optional INSTRUCTIONS, pass custom compaction guidance."
            (message "pi: aborted current run")
          (message "pi: %s" (or (plist-get response :error)
                                "Failed to abort")))))))
+
+(defun pi--format-number (value)
+  (if (numberp value)
+      (format "%s" value)
+    "?"))
+
+(defun pi--format-session-stats (stats)
+  (let* ((tokens (plist-get stats :tokens))
+         (context (plist-get stats :contextUsage))
+         (parts (list (format "%s messages" (pi--format-number (plist-get stats :totalMessages)))
+                      (format "%s tool calls" (pi--format-number (plist-get stats :toolCalls))))))
+    (when-let* ((total (plist-get tokens :total)))
+      (setq parts (append parts (list (format "%s tokens" total)))))
+    (when-let* ((cost (plist-get stats :cost)))
+      (setq parts (append parts (list (format "$%.4f" cost)))))
+    (when context
+      (let ((percent (plist-get context :percent))
+            (used (plist-get context :tokens))
+            (window (plist-get context :contextWindow)))
+        (setq parts
+              (append parts
+                      (list (format "context %s/%s%s"
+                                    (pi--format-number used)
+                                    (pi--format-number window)
+                                    (if (numberp percent)
+                                        (format " %.1f%%" percent)
+                                      "")))))))
+    (string-join parts " • ")))
+
+(defun pi-session-stats ()
+  "Show concise token/cost/context stats for the current session."
+  (interactive)
+  (let* ((source-buffer (pi--source-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-get-session-stats
+     session
+     (lambda (_s response)
+       (if (pi--rpc-success-p response)
+           (message "pi: %s" (pi--format-session-stats (plist-get response :data)))
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to load session stats")))))))
+
+(defun pi-last-assistant-text ()
+  "Copy the current session's last assistant text to the kill ring."
+  (interactive)
+  (let* ((source-buffer (pi--source-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-get-last-assistant-text
+     session
+     (lambda (_s response)
+       (if (pi--rpc-success-p response)
+           (let ((text (plist-get (plist-get response :data) :text)))
+             (if (and (stringp text) (not (string-empty-p text)))
+                 (progn
+                   (kill-new text)
+                   (message "pi: copied last assistant text"))
+               (message "pi: no assistant text in this session")))
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to load last assistant text")))))))
 
 (defun pi-export-session-html (path)
   "Export current session to HTML.
@@ -387,10 +694,28 @@ If PATH is empty, let pi choose the output path."
          (message "pi: %s" (or (plist-get response :error)
                                "Failed to cycle thinking level")))))))
 
+(defun pi--read-thinking-level (session)
+  "Read a thinking level supported by SESSION's current model."
+  (let* ((state (pi-session-cached-state session))
+         (model (plist-get state :model))
+         (levels (pi--supported-thinking-levels model))
+         (current (plist-get state :thinking-level)))
+    (unless levels
+      (user-error "pi: current model does not expose configurable thinking levels"))
+    (completing-read
+     (if current
+         (format "Thinking level (current %s): " current)
+       "Thinking level: ")
+     levels nil t nil nil
+     (and (member current levels) current))))
+
 (defun pi-set-thinking-level (level)
   "Set thinking LEVEL for the current session."
-  (interactive (list (completing-read "Thinking level: " pi-thinking-levels nil t)))
-  (let* ((source-buffer (current-buffer))
+  (interactive
+   (let* ((source-buffer (pi--source-buffer))
+          (session (pi--ensure-session source-buffer)))
+     (list (pi--read-thinking-level session))))
+  (let* ((source-buffer (pi--source-buffer))
          (session (pi--ensure-session source-buffer)))
     (pi-session-set-thinking-level
      session level

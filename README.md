@@ -8,7 +8,7 @@ It starts hidden `pi --mode rpc` subprocesses, keeps one session per project or 
 
 ## Status
 
-Early and evolving.
+Early and evolving. This package targets `@mariozechner/pi-coding-agent` 0.73.0 or newer and intentionally follows the current RPC protocol without compatibility shims for older pi releases.
 
 ## Features
 

@@ -20,6 +20,11 @@
 (require 'markdown-mode nil t)
 
 (declare-function pi-session-buffer-mode "pi-session-buffer" ())
+(declare-function pi-steer "pi" (message))
+(declare-function pi-follow-up "pi" (message))
+(declare-function pi-toggle-auto-compaction "pi" ())
+(declare-function pi-toggle-auto-retry "pi" ())
+(declare-function pi-abort-retry "pi" ())
 
 (defvar pi-ui-window-side)
 (defvar pi-ui-window-size)
@@ -44,6 +49,9 @@
 (defvar-local pi-ui--loading nil)
 (defvar-local pi-ui--pending-render-timer nil)
 (defvar-local pi-ui--tool-call-summary-by-id nil)
+(defvar-local pi-ui--extension-status nil)
+(defvar-local pi-ui--extension-widgets nil)
+(defvar-local pi-ui--extension-title nil)
 
 (defvar pi-session-buffer-mode-map
   (let ((map (make-sparse-keymap)))
@@ -61,6 +69,11 @@
                   (interactive)
                   (pi-ui--session-buffer-abort)))
     (define-key map (kbd "s") #'pi-ui--session-buffer-compose-prompt)
+    (define-key map (kbd "S") #'pi-steer)
+    (define-key map (kbd "F") #'pi-follow-up)
+    (define-key map (kbd "A") #'pi-toggle-auto-compaction)
+    (define-key map (kbd "M-r") #'pi-toggle-auto-retry)
+    (define-key map (kbd "M-a") #'pi-abort-retry)
     (define-key map (kbd "c")
                 (lambda ()
                   (interactive)
@@ -81,6 +94,9 @@
   (setq-local pi-ui--loading nil)
   (setq-local pi-ui--pending-render-timer nil)
   (setq-local pi-ui--tool-call-summary-by-id nil)
+  (setq-local pi-ui--extension-status nil)
+  (setq-local pi-ui--extension-widgets nil)
+  (setq-local pi-ui--extension-title nil)
   (setq-local header-line-format nil)
   (add-hook 'kill-buffer-hook #'pi-ui--session-buffer-killed nil t))
 
@@ -224,6 +240,9 @@
            (history pi-ui--history)
            (transients pi-ui--transient-items)
            (live pi-ui--live-message)
+           (extension-status pi-ui--extension-status)
+           (extension-widgets pi-ui--extension-widgets)
+           (extension-title pi-ui--extension-title)
            (session pi-ui--session)
            (windows (get-buffer-window-list buffer nil t))
            (follow-windows (and pi-ui-auto-scroll
@@ -239,6 +258,9 @@
                                   (pi-session-scope session)
                                   (pi-session-root session))
                           'face 'pi-ui-meta-face))
+      (when (or extension-title extension-status extension-widgets)
+        (insert (pi-ui--render-extension-state
+                 extension-status extension-widgets extension-title)))
       (when pi-ui--loading
         (insert (propertize "loading session messages...\n\n" 'face 'pi-ui-placeholder-face)))
       (let ((prev-tool-line nil))
@@ -270,6 +292,54 @@
     (setq-local pi-ui--transient-items
                 (append pi-ui--transient-items (list item))))
   (pi-ui--buffer-render buffer))
+
+(defun pi-ui--set-extension-status (buffer key text)
+  "Set extension status KEY to TEXT in BUFFER, or clear it when TEXT is nil."
+  (when (and (buffer-live-p buffer) (stringp key) (not (string-empty-p key)))
+    (with-current-buffer buffer
+      (setq-local pi-ui--extension-status
+                  (if text
+                      (cons (cons key text) (assoc-delete-all key pi-ui--extension-status))
+                    (assoc-delete-all key pi-ui--extension-status)))))
+  (pi-ui--schedule-render buffer))
+
+(defun pi-ui--set-extension-widget (buffer key lines placement &optional clear)
+  "Set extension widget KEY in BUFFER, or clear it when CLEAR is non-nil."
+  (when (and (buffer-live-p buffer) (stringp key) (not (string-empty-p key)))
+    (with-current-buffer buffer
+      (setq-local pi-ui--extension-widgets
+                  (if clear
+                      (assoc-delete-all key pi-ui--extension-widgets)
+                    (cons (list key lines placement)
+                          (assoc-delete-all key pi-ui--extension-widgets))))))
+  (pi-ui--schedule-render buffer))
+
+(defun pi-ui--set-extension-title (buffer title)
+  "Set extension TITLE in BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq-local pi-ui--extension-title title)))
+  (pi-ui--schedule-render buffer))
+
+(defun pi-ui--upsert-tool-transient (buffer item)
+  "Insert or replace a live tool transient ITEM in BUFFER."
+  (let ((tool-call-id (plist-get item :tool-call-id)))
+    (with-current-buffer buffer
+      (setq-local
+       pi-ui--transient-items
+       (if (and (stringp tool-call-id) (not (string-empty-p tool-call-id)))
+           (let* ((replaced nil)
+                  (items (mapcar (lambda (existing)
+                                   (if (and (eq (plist-get existing :kind) 'tool-result)
+                                            (equal (plist-get existing :tool-call-id) tool-call-id))
+                                       (progn
+                                         (setq replaced t)
+                                         item)
+                                     existing))
+                                 pi-ui--transient-items)))
+             (if replaced items (append items (list item))))
+         (append pi-ui--transient-items (list item))))))
+  (pi-ui--schedule-render buffer))
 
 (defun pi-ui--append-history-message (buffer message)
   (with-current-buffer buffer
@@ -365,79 +435,123 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
   (let ((message (plist-get event :message)))
     (and message (plist-get message :role))))
 
-(defun pi-ui--assistant-event-p (event)
-  (or (equal (pi-ui--event-message-role event) "assistant")
-      (equal (plist-get event :role) "assistant")
-      (equal (plist-get event :messageRole) "assistant")))
+(defun pi-ui--message-update-assistant-p (event)
+  "Return non-nil when EVENT is a current assistant message update."
+  (let ((message-event (plist-get event :assistantMessageEvent)))
+    (and (listp message-event)
+         (equal (pi-ui--event-message-role event) "assistant"))))
 
-(defun pi-ui--event-text-delta (event)
-  (let ((delta (or (plist-get event :delta)
-                   (plist-get event :text)
-                   (plist-get event :contentDelta)
-                   (plist-get event :textDelta))))
+(defun pi-ui--tool-event-content-text (object)
+  "Extract text content from a current RPC tool result OBJECT."
+  (let ((content (and object (plist-get object :content))))
     (cond
-     ((stringp delta) delta)
-     ((listp delta)
-      (or (plist-get delta :text)
-          (let ((content (plist-get delta :content)))
-            (when (listp content)
-              (string-join
-               (delq nil
-                     (mapcar (lambda (block)
-                               (let ((text (pi-ui--stringify-content-block block)))
-                                 (unless (string-empty-p text) text)))
-                             content))
-               "\n")))))
-     (t nil))))
+     ((listp content)
+      (string-join
+       (delq nil
+             (mapcar (lambda (block)
+                       (let ((text (pi-ui--stringify-content-block block)))
+                         (unless (string-empty-p text) text)))
+                     content))
+       "\n"))
+     ((stringp content) content)
+     (t ""))))
 
-(defun pi-ui--append-live-delta (buffer text)
-  (when (and (stringp text) (not (string-empty-p text)))
-    (with-current-buffer buffer
-      (let* ((message (or pi-ui--live-message (list :role "assistant" :content nil)))
-             (content (pi-ui--normalize-message-content (plist-get message :content))))
-        (if (and content
-                 (equal (plist-get (car (last content)) :type) "text"))
-            (let* ((prefix (butlast content))
-                   (last-block (car (last content)))
-                   (updated-last (list :type "text"
-                                       :text (concat (or (plist-get last-block :text) "") text))))
-              (setq content (append prefix (list updated-last))))
-          (setq content (append content (list (list :type "text" :text text)))))
-        (setq-local pi-ui--live-message
-                    (plist-put message :content content))))))
+(defun pi-ui--format-count (value singular plural)
+  (when (numberp value)
+    (format "%s %s" value (if (= value 1) singular plural))))
+
+(defun pi-ui--format-delay-ms (delay-ms)
+  (when (numberp delay-ms)
+    (format "%.1fs" (/ delay-ms 1000.0))))
+
+(defun pi-ui--compaction-result-summary (result)
+  (let ((parts nil))
+    (when-let* ((tokens (plist-get result :tokensBefore)))
+      (push (pi-ui--format-count tokens "token" "tokens") parts))
+    (when-let* ((entry-id (plist-get result :firstKeptEntryId))
+                ((stringp entry-id))
+                ((not (string-empty-p entry-id))))
+      (push (format "kept from %s" (substring entry-id 0 (min 8 (length entry-id)))) parts))
+    (string-join (nreverse (delq nil parts)) ", ")))
+
+(defun pi-ui--status-item-from-event (event)
+  (pcase (plist-get event :type)
+    ("compaction_start"
+     (list :kind 'status
+           :text (format "Compaction started%s"
+                         (if-let* ((reason (plist-get event :reason)))
+                             (format " (%s)" reason)
+                           ""))))
+    ("compaction_end"
+     (let ((reason (plist-get event :reason))
+           (result (plist-get event :result))
+           (error (plist-get event :errorMessage)))
+       (list :kind 'status
+             :text (cond
+                    ((eq (plist-get event :aborted) t)
+                     (format "Compaction cancelled%s"
+                             (if reason (format " (%s)" reason) "")))
+                    (error
+                     (format "Compaction failed%s: %s"
+                             (if reason (format " (%s)" reason) "")
+                             error))
+                    (result
+                     (let ((summary (pi-ui--compaction-result-summary result)))
+                       (format "Compaction complete%s%s%s"
+                               (if reason (format " (%s)" reason) "")
+                               (if (string-empty-p summary) "" (format ": %s" summary))
+                               (if (eq (plist-get event :willRetry) t)
+                                   "; retrying prompt"
+                                 ""))))
+                    (t "Compaction complete")))))
+    ("auto_retry_start"
+     (list :kind 'status
+           :text (format "Auto-retry %s/%s in %s%s"
+                         (or (plist-get event :attempt) "?")
+                         (or (plist-get event :maxAttempts) "?")
+                         (or (pi-ui--format-delay-ms (plist-get event :delayMs)) "soon")
+                         (if-let* ((error (plist-get event :errorMessage)))
+                             (format ": %s" (pi-ui--truncate-inline error 120))
+                           ""))))
+    ("auto_retry_end"
+     (list :kind 'status
+           :text (if (eq (plist-get event :success) t)
+                     (format "Auto-retry succeeded%s"
+                             (if-let* ((attempt (plist-get event :attempt)))
+                                 (format " after attempt %s" attempt)
+                               ""))
+                   (format "Auto-retry stopped%s%s"
+                           (if-let* ((attempt (plist-get event :attempt)))
+                               (format " after %s attempt%s" attempt (if (= attempt 1) "" "s"))
+                             "")
+                           (if-let* ((error (plist-get event :finalError)))
+                               (format ": %s" (pi-ui--truncate-inline error 120))
+                             "")))))))
 
 (defun pi-ui--tool-result-from-event (event)
-  (let* ((result (plist-get event :result))
+  (let* ((result (or (plist-get event :result)
+                     (plist-get event :partialResult)))
          (tool-name (or (plist-get event :toolName)
                         (and result (plist-get result :toolName))))
          (tool-call-id (or (plist-get event :toolCallId)
-                           (plist-get event :toolUseId)
-                           (plist-get event :callId)
-                           (and result (plist-get result :toolCallId))
-                           (and result (plist-get result :toolUseId))
-                           (and result (plist-get result :callId))))
-         (arguments (or (pi-ui--tool-arguments-from-object event)
+                           (and result (plist-get result :toolCallId))))
+         (arguments (or (plist-get event :args)
+                        (and result (plist-get result :args))
+                        (pi-ui--tool-arguments-from-object event)
                         (and result (pi-ui--tool-arguments-from-object result))))
-         (content (and result (plist-get result :content))))
-    (when (or result (plist-get event :error))
-      (list :kind 'tool-result
-            :tool-name tool-name
-            :tool-call-id tool-call-id
-            :arguments arguments
-            :detail (pi-ui--tool-detail-from-arguments tool-name arguments)
-            :status (pi-ui--tool-status-from-event event)
-            :duration-ms (pi-ui--tool-duration-from-event event)
-            :text (cond
-                   ((listp content)
-                    (string-join
-                     (delq nil
-                           (mapcar (lambda (block)
-                                     (let ((text (pi-ui--stringify-content-block block)))
-                                       (unless (string-empty-p text) text)))
-                                   content))
-                     "\n"))
-                   ((stringp content) content)
-                   (t ""))))))
+         (event-type (plist-get event :type))
+         (status (pcase event-type
+                   ("tool_execution_start" 'running)
+                   ("tool_execution_update" 'running)
+                   (_ (pi-ui--tool-status-from-event event)))))
+    (list :kind 'tool-result
+          :tool-name tool-name
+          :tool-call-id tool-call-id
+          :arguments arguments
+          :detail (pi-ui--tool-detail-from-arguments tool-name arguments)
+          :status status
+          :duration-ms (pi-ui--tool-duration-from-event event)
+          :text (pi-ui--tool-event-content-text result))))
 
 (defun pi-ui--handle-session-event (session event)
   (let* ((event-type (plist-get event :type))
@@ -452,18 +566,12 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
              (setq-local pi-ui--live-message (plist-get event :message)))
            (pi-ui--schedule-render buffer t)))
         ("message_update"
-         (let ((message (plist-get event :message)))
-           (when (and message (equal (plist-get message :role) "assistant"))
-             (with-current-buffer buffer
-               (setq-local pi-ui--live-message message))
-             (if pi-ui-enable-streaming
-                 (pi-ui--schedule-render buffer)
-               (pi-ui--schedule-render buffer t)))))
-        ((or "message_delta" "content_delta" "assistant_delta" "text_delta")
-         (when (and pi-ui-enable-streaming (pi-ui--assistant-event-p event))
-           (when-let* ((delta (pi-ui--event-text-delta event)))
-             (pi-ui--append-live-delta buffer delta)
-             (pi-ui--schedule-render buffer))))
+         (when (pi-ui--message-update-assistant-p event)
+           (with-current-buffer buffer
+             (setq-local pi-ui--live-message (plist-get event :message)))
+           (if pi-ui-enable-streaming
+               (pi-ui--schedule-render buffer)
+             (pi-ui--schedule-render buffer t))))
         ("message_end"
          (let ((message (plist-get event :message)))
            (pcase (plist-get message :role)
@@ -474,11 +582,22 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
              ("user"
               (pi-ui--append-history-message buffer message))
              ("toolResult" nil))))
-        ("tool_execution_end"
-         (when-let* ((item (pi-ui--tool-result-from-event event)))
-           (pi-ui--append-transient buffer item)))
+        ((or "tool_execution_start" "tool_execution_update" "tool_execution_end")
+         (pi-ui--upsert-tool-transient buffer (pi-ui--tool-result-from-event event)))
+        ("queue_update"
+         (pi-ui--update-session-header-line buffer))
+        ((or "compaction_start" "compaction_end"
+             "auto_retry_start" "auto_retry_end")
+         (pi-ui--append-transient buffer (pi-ui--status-item-from-event event))
+         (pi-ui--update-session-header-line buffer))
         ("extension_ui_request"
          (pi-ui--handle-extension-ui-event session buffer event))
+        ("extension_error"
+         (pi-ui--append-transient
+          buffer
+          (list :kind 'error
+                :text (or (plist-get event :error)
+                          "Extension error"))))
         ((or "session_error" "session_exit")
          (let ((text (or (plist-get event :error)
                          (plist-get event :event)
