@@ -10,6 +10,7 @@
 
 ;;; Code:
 
+(require 'ansi-color)
 (require 'cl-lib)
 (require 'json)
 (require 'seq)
@@ -164,6 +165,13 @@
            (unless (string-empty-p (or text ""))
              (push text pieces))))))
     (string-join (nreverse pieces) "\n\n")))
+
+(defun pi-ui--display-text (text)
+  "Return TEXT with terminal escape sequences removed for buffer display."
+  (cond
+   ((null text) "")
+   ((stringp text) (ansi-color-filter-apply text))
+   (t (ansi-color-filter-apply (format "%s" text)))))
 
 (defun pi-ui--truncate-lines (text max-lines)
   (let* ((lines (split-string (or text "") "\n"))
@@ -468,17 +476,17 @@
 (defun pi-ui--render-extension-state (statuses widgets title)
   (let (lines)
     (when (and (stringp title) (not (string-empty-p title)))
-      (push (format "Title: %s" title) lines))
+      (push (format "Title: %s" (pi-ui--display-text title)) lines))
     (dolist (entry (reverse statuses))
       (let ((key (car entry))
             (text (cdr entry)))
         (when (and (stringp text) (not (string-empty-p text)))
-          (push (format "%s: %s" key text) lines))))
+          (push (format "%s: %s" key (pi-ui--display-text text)) lines))))
     (dolist (widget (reverse widgets))
       (pcase-let ((`(,key ,widget-lines ,_placement) widget))
         (push (format "Widget %s:" key) lines)
         (dolist (line widget-lines)
-          (push (format "  %s" line) lines))))
+          (push (format "  %s" (pi-ui--display-text line)) lines))))
     (if lines
         (concat (propertize "Extension UI\n" 'face 'pi-ui-meta-face)
                 (propertize (string-join (nreverse lines) "\n")

@@ -62,6 +62,15 @@
     (should (equal (plist-get item :tool-call-id) "call-1"))
     (should (equal (plist-get item :text) "line 1\nline 2"))))
 
+(ert-deftest pi-render-extension-state-strips-ansi-escapes ()
+  (let ((rendered (pi-ui--render-extension-state
+                   '(("mcp" . "\33[38;5;116mMCP: 0/2 servers\33[39m"))
+                   nil
+                   nil)))
+    (should (string-match-p "mcp: MCP: 0/2 servers" rendered))
+    (should-not (string-match-p "\\[38;5;116m" rendered))
+    (should-not (string-match-p "\33" rendered))))
+
 (ert-deftest pi-thinking-level-map-filters-supported-levels ()
   (let ((model '(:thinkingLevelMap (:off t :minimal :json-false :low t :medium t :high :json-false))))
     (should (equal (pi--supported-thinking-levels model)
