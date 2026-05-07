@@ -13,8 +13,10 @@
 (require 'project)
 (require 'seq)
 (require 'subr-x)
+(require 'pi-rpc)
 (require 'pi-session)
 
+(declare-function pi-rpc-success-p "pi-rpc" (response))
 (declare-function pi-ui-send-prompt "pi-session-buffer" (source-buffer prompt))
 
 (defvar pi-ui-prompt-window-side)
@@ -194,7 +196,7 @@
          (when (buffer-live-p prompt-buffer)
            (with-current-buffer prompt-buffer
              (setq-local pi-ui--prompt-command-loading nil)
-             (if (eq (plist-get response :success) :json-false)
+             (if (not (pi-rpc-success-p response))
                  (message "pi: %s" (or (plist-get response :error)
                                        "Failed to load /commands"))
                (let ((commands (plist-get (plist-get response :data) :commands))

@@ -113,6 +113,14 @@ COMMAND may be an alist or plist."
         (json-null nil))
     (concat (json-encode command) "\n")))
 
+(defun pi-rpc-json-truthy-p (value)
+  "Return non-nil when VALUE represents a true JSON/RPC boolean."
+  (and value (not (eq value :json-false))))
+
+(defun pi-rpc-success-p (response)
+  "Return non-nil when RESPONSE is a successful RPC response."
+  (pi-rpc-json-truthy-p (plist-get response :success)))
+
 (defun pi-rpc--call-handler (fn &rest args)
   "Call FN with ARGS, ignoring nil handlers."
   (when fn

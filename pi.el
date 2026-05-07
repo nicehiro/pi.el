@@ -16,6 +16,9 @@
 (require 'seq)
 (require 'subr-x)
 
+(declare-function pi-rpc-json-truthy-p "pi-rpc" (value))
+(declare-function pi-rpc-success-p "pi-rpc" (response))
+
 (declare-function pi-ui-open-session "pi-ui" (&optional source-buffer))
 (declare-function pi-ui-show-session-buffer "pi-ui" (&optional session source-buffer))
 (declare-function pi-ui-toggle-session-buffer "pi-ui" (session &optional source-buffer))
@@ -112,8 +115,7 @@ create a new session for the scope."
   (interactive)
   (pi-ui-open-session (current-buffer)))
 
-(defun pi--rpc-success-p (response)
-  (not (eq (plist-get response :success) :json-false)))
+(defalias 'pi--rpc-success-p #'pi-rpc-success-p)
 
 (defun pi--ensure-session (source-buffer &optional session-file)
   (let ((session (pi-session-ensure-for-buffer source-buffer session-file)))
@@ -428,9 +430,9 @@ With optional INSTRUCTIONS, pass custom compaction guidance."
   (interactive)
   (let* ((source-buffer (pi--source-buffer))
          (session (pi--ensure-session source-buffer))
-         (enabled (not (eq (plist-get (pi-session-cached-state session)
-                                      :auto-compaction-enabled)
-                          t))))
+         (enabled (not (pi-rpc-json-truthy-p
+                        (plist-get (pi-session-cached-state session)
+                                   :auto-compaction-enabled)))))
     (pi-session-set-auto-compaction
      session enabled
      (lambda (_s response)
@@ -485,9 +487,9 @@ With optional INSTRUCTIONS, pass custom compaction guidance."
   (interactive
    (let* ((source-buffer (pi--source-buffer))
           (session (pi--ensure-session source-buffer))
-          (current (eq (plist-get (pi-session-cached-state session)
-                                  :auto-retry-enabled)
-                       t)))
+          (current (pi-rpc-json-truthy-p
+                    (plist-get (pi-session-cached-state session)
+                               :auto-retry-enabled))))
      (list (y-or-n-p (format "Enable auto-retry? (currently %s) "
                              (if current "enabled" "disabled"))))))
   (let* ((source-buffer (pi--source-buffer))
@@ -505,9 +507,9 @@ With optional INSTRUCTIONS, pass custom compaction guidance."
   (interactive)
   (let* ((source-buffer (pi--source-buffer))
          (session (pi--ensure-session source-buffer))
-         (enabled (not (eq (plist-get (pi-session-cached-state session)
-                                      :auto-retry-enabled)
-                          t))))
+         (enabled (not (pi-rpc-json-truthy-p
+                        (plist-get (pi-session-cached-state session)
+                                   :auto-retry-enabled)))))
     (pi-session-set-auto-retry
      session enabled
      (lambda (_s response)

@@ -80,7 +80,29 @@
       (when (buffer-live-p session-buffer)
         (kill-buffer session-buffer)))))
 
-(ert-deftest pi-session-apply-state-preserves-local-auto-retry ()
+(ert-deftest pi-session-apply-state-normalizes-json-booleans ()
+  (let ((session (pi-session--create
+                  :id "test-session"
+                  :cached-state '(:auto-retry-enabled t :is-retrying t))))
+    (pi-session--apply-state
+     session
+     '(:success t
+       :data (:model (:id "m")
+              :thinkingLevel "off"
+              :isStreaming :json-false
+              :isCompacting :json-false
+              :autoCompactionEnabled :json-false
+              :autoRetryEnabled :json-false
+              :isRetrying :json-false
+              :sessionFile "/tmp/pi-test.jsonl"
+              :sessionId "sid")))
+    (should-not (plist-get (pi-session-cached-state session) :is-streaming))
+    (should-not (plist-get (pi-session-cached-state session) :is-compacting))
+    (should-not (plist-get (pi-session-cached-state session) :auto-compaction-enabled))
+    (should-not (plist-get (pi-session-cached-state session) :auto-retry-enabled))
+    (should-not (plist-get (pi-session-cached-state session) :is-retrying))))
+
+(ert-deftest pi-session-apply-state-preserves-absent-local-auto-retry ()
   (let ((session (pi-session--create
                   :id "test-session"
                   :cached-state '(:auto-retry-enabled t :is-retrying t))))
@@ -95,6 +117,23 @@
               :sessionId "sid")))
     (should (eq (plist-get (pi-session-cached-state session) :auto-retry-enabled) t))
     (should (eq (plist-get (pi-session-cached-state session) :is-retrying) t))))
+
+(ert-deftest pi-session-send-prompt-json-false-streaming-uses-prompt ()
+  (let* ((sent-command nil)
+         (session (pi-session--create
+                   :id "test-session"
+                   :status 'ready
+                   :cached-state '(:is-streaming :json-false)
+                   :rpc 'fake-rpc)))
+    (cl-letf (((symbol-function 'pi-rpc-live-p) (lambda (_rpc) t))
+              ((symbol-function 'pi-session--touch) #'ignore)
+              ((symbol-function 'pi-rpc-send)
+               (lambda (_rpc command callback)
+                 (setq sent-command command)
+                 (funcall callback '(:success t))
+                 "req-test")))
+      (pi-session-send-prompt session "hello"))
+    (should (equal (cdr (assoc "type" sent-command)) "prompt"))))
 
 (ert-deftest pi-session-dir-resolution-current-defaults ()
   (let ((pi-session-directory nil)

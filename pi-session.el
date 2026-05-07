@@ -21,6 +21,9 @@
 (require 'subr-x)
 (require 'pi-rpc)
 
+(declare-function pi-rpc-json-truthy-p "pi-rpc" (value))
+(declare-function pi-rpc-success-p "pi-rpc" (response))
+
 (defgroup pi-session nil
   "Session management for pi."
   :group 'applications)
@@ -587,8 +590,8 @@ selected text as `:editor-text', matching current `/tree' behavior."
 
 (defun pi-session--session-replacement-callback (session response callback)
   "Refresh SESSION state after RESPONSE from a session-replacing command."
-  (if (or (eq (plist-get response :success) :json-false)
-          (plist-get (plist-get response :data) :cancelled))
+  (if (or (not (pi-rpc-success-p response))
+          (pi-rpc-json-truthy-p (plist-get (plist-get response :data) :cancelled)))
       (when callback
         (funcall callback session response))
     (pi-session--request-state
@@ -596,7 +599,7 @@ selected text as `:editor-text', matching current `/tree' behavior."
      (lambda (_s _state state-response)
        (when callback
          (funcall callback session
-                  (if (eq (plist-get state-response :success) :json-false)
+                  (if (not (pi-rpc-success-p state-response))
                       state-response
                     response)))))))
 
@@ -709,7 +712,8 @@ The plist keys are :kind, :root, :name, and :key."
     (setf (pi-session-idle-timer session) nil)))
 
 (defun pi-session--streaming-p (session)
-  (plist-get (pi-session-cached-state session) :is-streaming))
+  (pi-rpc-json-truthy-p
+   (plist-get (pi-session-cached-state session) :is-streaming)))
 
 (defun pi-session--set-streaming (session value)
   (setf (pi-session-cached-state session)
@@ -797,14 +801,15 @@ The plist keys are :kind, :root, :name, and :key."
   (let ((data (plist-get response :data)))
     (list :model (plist-get data :model)
           :thinking-level (plist-get data :thinkingLevel)
-          :is-streaming (plist-get data :isStreaming)
-          :is-compacting (plist-get data :isCompacting)
+          :is-streaming (pi-rpc-json-truthy-p (plist-get data :isStreaming))
+          :is-compacting (pi-rpc-json-truthy-p (plist-get data :isCompacting))
           :steering-mode (plist-get data :steeringMode)
           :follow-up-mode (plist-get data :followUpMode)
           :session-file (plist-get data :sessionFile)
           :session-id (plist-get data :sessionId)
           :session-name (plist-get data :sessionName)
-          :auto-compaction-enabled (plist-get data :autoCompactionEnabled)
+          :auto-compaction-enabled (pi-rpc-json-truthy-p
+                                    (plist-get data :autoCompactionEnabled))
           :message-count (plist-get data :messageCount)
           :pending-message-count (plist-get data :pendingMessageCount)
           :last-refresh-at (float-time))))
@@ -822,7 +827,11 @@ The plist keys are :kind, :root, :name, and :key."
         (setq state
               (cond
                ((plist-member data data-key)
-                (plist-put state state-key (plist-get data data-key)))
+                (plist-put state state-key
+                           (if (memq state-key '(:auto-retry-enabled
+                                                 :is-retrying))
+                               (pi-rpc-json-truthy-p (plist-get data data-key))
+                             (plist-get data data-key))))
                ((plist-member previous-state state-key)
                 (plist-put state state-key (plist-get previous-state state-key)))
                (t state)))))
@@ -882,7 +891,7 @@ The plist keys are :kind, :root, :name, and :key."
    (pi-session-rpc session)
    '(("type" . "get_state"))
    (lambda (response)
-     (if (eq (plist-get response :success) :json-false)
+     (if (not (pi-rpc-success-p response))
          (funcall callback session nil response)
        (pi-session--apply-state session response)
        (funcall callback session (pi-session-cached-state session) response)))))
@@ -897,7 +906,7 @@ The plist keys are :kind, :root, :name, and :key."
     (pi-session--request-state
      session
      (lambda (_session state response)
-       (if (eq (plist-get response :success) :json-false)
+       (if (not (pi-rpc-success-p response))
            (pi-session--emit-start-error session (or (plist-get response :error)
                                                      "Failed to read session state"))
          (let ((current-file (plist-get state :session-file)))
@@ -909,7 +918,7 @@ The plist keys are :kind, :root, :name, and :key."
                 `(("type" . "switch_session")
                   ("sessionPath" . ,resume-file))
                 (lambda (switch-response)
-                  (if (eq (plist-get switch-response :success) :json-false)
+                  (if (not (pi-rpc-success-p switch-response))
                       (pi-session--emit-start-error
                        session
                        (or (plist-get switch-response :error)
@@ -917,7 +926,7 @@ The plist keys are :kind, :root, :name, and :key."
                     (pi-session--request-state
                      session
                      (lambda (_s _state2 response2)
-                       (if (eq (plist-get response2 :success) :json-false)
+                       (if (not (pi-rpc-success-p response2))
                            (pi-session--emit-start-error
                             session
                             (or (plist-get response2 :error)
@@ -990,7 +999,7 @@ as the initial session file to resume."
       `(("type" . ,command-type)
         ("message" . ,message))
       (lambda (response)
-        (when (eq (plist-get response :success) :json-false)
+        (when (not (pi-rpc-success-p response))
           (run-hook-with-args 'pi-session-event-hook session
                               (list :type "session_error"
                                     :error (plist-get response :error))))
@@ -1097,7 +1106,7 @@ CALLBACK receives `(SESSION RESPONSE)'."
       (pi-session-rpc session)
       '(("type" . "new_session"))
       (lambda (response)
-        (if (eq (plist-get response :success) :json-false)
+        (if (not (pi-rpc-success-p response))
             (when callback
               (funcall callback session response))
           (pi-session--request-state
@@ -1105,7 +1114,7 @@ CALLBACK receives `(SESSION RESPONSE)'."
            (lambda (_s _state state-response)
              (when callback
                (funcall callback session
-                        (if (eq (plist-get state-response :success) :json-false)
+                        (if (not (pi-rpc-success-p state-response))
                             state-response
                           response)))))))))))
 
@@ -1129,7 +1138,7 @@ CALLBACK receives `(SESSION RESPONSE)'."
          (pi-session--request-state
           session
           (lambda (_s state state-response)
-            (if (eq (plist-get state-response :success) :json-false)
+            (if (not (pi-rpc-success-p state-response))
                 (when callback
                   (funcall callback session state-response))
               (let ((current-file (plist-get state :session-file)))
@@ -1146,18 +1155,18 @@ CALLBACK receives `(SESSION RESPONSE)'."
                    `(("type" . "switch_session")
                      ("sessionPath" . ,session-file))
                    (lambda (switch-response)
-                     (if (eq (plist-get switch-response :success) :json-false)
+                     (if (not (pi-rpc-success-p switch-response))
                          (when callback
                            (funcall callback session switch-response))
                        (pi-session--request-state
                         session
                         (lambda (_s2 _state2 response2)
-                          (unless (eq (plist-get response2 :success) :json-false)
+                          (when (pi-rpc-success-p response2)
                             (pi-session--set-active-file (pi-session-scope-key session)
                                                          session-file))
                           (when callback
                             (funcall callback session
-                                     (if (eq (plist-get response2 :success) :json-false)
+                                     (if (not (pi-rpc-success-p response2))
                                          response2
                                        (list :success t
                                              :data (pi-session-cached-state session))))))))))))))))))))
@@ -1201,7 +1210,7 @@ CALLBACK receives `(SESSION RESPONSE)'."
       `(("type" . ,command-type)
         ("mode" . ,mode))
       (lambda (response)
-        (if (eq (plist-get response :success) :json-false)
+        (if (not (pi-rpc-success-p response))
             (when callback
               (funcall callback session response))
           (setf (pi-session-cached-state session)
@@ -1227,7 +1236,7 @@ CALLBACK receives `(SESSION RESPONSE)'."
       `(("type" . "set_auto_compaction")
         ("enabled" . ,(if enabled t :json-false)))
       (lambda (response)
-        (if (eq (plist-get response :success) :json-false)
+        (if (not (pi-rpc-success-p response))
             (when callback
               (funcall callback session response))
           (pi-session--request-state
@@ -1246,7 +1255,7 @@ CALLBACK receives `(SESSION RESPONSE)'."
       `(("type" . "set_auto_retry")
         ("enabled" . ,(if enabled t :json-false)))
       (lambda (response)
-        (unless (eq (plist-get response :success) :json-false)
+        (when (pi-rpc-success-p response)
           (setf (pi-session-cached-state session)
                 (plist-put (pi-session-cached-state session)
                            :auto-retry-enabled
@@ -1317,7 +1326,7 @@ CALLBACK receives `(SESSION RESPONSE)'."
         ("provider" . ,provider)
         ("modelId" . ,model-id))
       (lambda (response)
-        (if (eq (plist-get response :success) :json-false)
+        (if (not (pi-rpc-success-p response))
             (when callback
               (funcall callback session response))
           (pi-session--request-state
@@ -1335,7 +1344,7 @@ CALLBACK receives `(SESSION RESPONSE)'."
       (pi-session-rpc session)
       '(("type" . "cycle_model"))
       (lambda (response)
-        (unless (eq (plist-get response :success) :json-false)
+        (when (pi-rpc-success-p response)
           (when-let* ((data (plist-get response :data))
                       (model (plist-get data :model)))
             (setf (pi-session-cached-state session)
@@ -1361,7 +1370,7 @@ CALLBACK receives `(SESSION RESPONSE)'."
       `(("type" . "set_thinking_level")
         ("level" . ,level))
       (lambda (response)
-        (if (eq (plist-get response :success) :json-false)
+        (if (not (pi-rpc-success-p response))
             (when callback
               (funcall callback session response))
           (pi-session--request-state
@@ -1379,7 +1388,7 @@ CALLBACK receives `(SESSION RESPONSE)'."
       (pi-session-rpc session)
       '(("type" . "cycle_thinking_level"))
       (lambda (response)
-        (unless (eq (plist-get response :success) :json-false)
+        (when (pi-rpc-success-p response)
           (when-let* ((data (plist-get response :data))
                       (level (plist-get data :level)))
             (setf (pi-session-cached-state session)

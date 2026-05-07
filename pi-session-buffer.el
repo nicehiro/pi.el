@@ -13,12 +13,14 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'pi-rpc)
 (require 'pi-session)
 (require 'pi-prompt)
 (require 'pi-render)
 (require 'pi-extension-ui)
 (require 'markdown-mode nil t)
 
+(declare-function pi-rpc-success-p "pi-rpc" (response))
 (declare-function pi-session-buffer-mode "pi-session-buffer" ())
 (declare-function pi-steer "pi" (message))
 (declare-function pi-follow-up "pi" (message))
@@ -367,7 +369,7 @@
     (pi-session-load-messages
      session
      (lambda (_session response)
-       (if (eq (plist-get response :success) :json-false)
+       (if (not (pi-rpc-success-p response))
            (progn
              (message "pi: %s" (plist-get response :error))
              (pi-ui--append-transient
@@ -425,7 +427,7 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
     (pi-session-send-prompt
      session prompt
      (lambda (_session response)
-       (when (eq (plist-get response :success) :json-false)
+       (when (not (pi-rpc-success-p response))
          (message "pi: %s" (plist-get response :error)))))
     (when (window-live-p source-window)
       (select-window source-window))
@@ -655,7 +657,7 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
     (user-error "Not in a pi session buffer"))
   (pi-session-abort pi-ui--session
                     (lambda (_session response)
-                      (when (eq (plist-get response :success) :json-false)
+                      (when (not (pi-rpc-success-p response))
                         (message "pi abort failed: %s" (plist-get response :error))))))
 
 (defun pi-ui--session-buffer-compose-prompt ()

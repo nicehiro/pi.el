@@ -14,7 +14,11 @@
 (require 'json)
 (require 'seq)
 (require 'subr-x)
+(require 'pi-rpc)
 (require 'pi-session)
+
+(declare-function pi-rpc-json-truthy-p "pi-rpc" (value))
+(declare-function pi-rpc-success-p "pi-rpc" (response))
 
 (defvar pi-ui-show-thinking)
 (defvar pi-ui-tool-result-max-lines)
@@ -59,9 +63,9 @@
     (with-current-buffer buffer
       (and (bound-and-true-p pi-ui--session)
            (let ((state (pi-session-cached-state pi-ui--session)))
-             (or (plist-get state :is-streaming)
-                 (plist-get state :is-compacting)
-                 (plist-get state :is-retrying)))
+             (or (pi-rpc-json-truthy-p (plist-get state :is-streaming))
+                 (pi-rpc-json-truthy-p (plist-get state :is-compacting))
+                 (pi-rpc-json-truthy-p (plist-get state :is-retrying))))
            (get-buffer-window buffer t)))))
 
 (defun pi-ui--stop-spinner-timer ()
@@ -91,11 +95,11 @@
     (let* ((state (pi-session-cached-state session))
            (items nil))
       (push (cond
-             ((plist-get state :is-compacting)
+             ((pi-rpc-json-truthy-p (plist-get state :is-compacting))
               (format "%s Compacting" (pi-ui--spinner-frame)))
-             ((plist-get state :is-retrying)
+             ((pi-rpc-json-truthy-p (plist-get state :is-retrying))
               (format "%s Retrying" (pi-ui--spinner-frame)))
-             ((plist-get state :is-streaming)
+             ((pi-rpc-json-truthy-p (plist-get state :is-streaming))
               (format "%s Working" (pi-ui--spinner-frame)))
              (t "○ Idle"))
             items)
@@ -107,9 +111,9 @@
                   ((numberp pending))
                   ((> pending 0)))
         (push (format "Queued: %d" pending) items))
-      (when (eq (plist-get state :auto-compaction-enabled) t)
+      (when (pi-rpc-json-truthy-p (plist-get state :auto-compaction-enabled))
         (push "Auto-compact" items))
-      (when (eq (plist-get state :auto-retry-enabled) t)
+      (when (pi-rpc-json-truthy-p (plist-get state :auto-retry-enabled))
         (push "Auto-retry" items))
       (propertize (string-join (nreverse items) " • ")
                   'face 'pi-ui-meta-face))))
@@ -344,9 +348,11 @@
 
 (defun pi-ui--tool-status-from-event (event)
   (let* ((result (plist-get event :result))
-         (result-error (and result (or (plist-get result :error)
-                                       (eq (plist-get result :isError) t)
-                                       (eq (plist-get result :success) :json-false)))))
+         (result-error (and result
+                            (or (plist-get result :error)
+                                (eq (plist-get result :isError) t)
+                                (and (plist-member result :success)
+                                     (not (pi-rpc-success-p result)))))))
     (cond
      ((or (plist-get event :error)
           (eq (plist-get event :isError) t)
@@ -359,7 +365,8 @@
   (cond
    ((or (plist-get message :error)
         (eq (plist-get message :isError) t)
-        (eq (plist-get message :success) :json-false))
+        (and (plist-member message :success)
+             (not (pi-rpc-success-p message))))
     'error)
    ((plist-get message :content) 'success)
    (t 'unknown)))
