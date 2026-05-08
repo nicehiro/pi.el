@@ -127,8 +127,29 @@
     (should (eq (plist-get (pi-session-cached-state session) :auto-retry-enabled) t))
     (should (eq (plist-get (pi-session-cached-state session) :is-retrying) t))))
 
-(ert-deftest pi-session-send-prompt-json-false-streaming-uses-prompt ()
-  (let* ((sent-command nil)
+(ert-deftest pi-session-send-prompt-refreshes-state-before-prompt ()
+  (let* ((sent-commands nil)
+         (session (pi-session--create
+                   :id "test-session"
+                   :status 'ready
+                   :cached-state '(:is-streaming t)
+                   :rpc 'fake-rpc)))
+    (cl-letf (((symbol-function 'pi-rpc-live-p) (lambda (_rpc) t))
+              ((symbol-function 'pi-session--touch) #'ignore)
+              ((symbol-function 'pi-rpc-send)
+               (lambda (_rpc command callback)
+                 (push command sent-commands)
+                 (if (equal (cdr (assoc "type" command)) "get_state")
+                     (funcall callback '(:success t :data (:isStreaming :json-false)))
+                   (funcall callback '(:success t)))
+                 "req-test")))
+      (pi-session-send-prompt session "hello"))
+    (let ((prompt-command (car sent-commands)))
+      (should (equal (cdr (assoc "type" prompt-command)) "prompt"))
+      (should-not (assoc "streamingBehavior" prompt-command)))))
+
+(ert-deftest pi-session-send-prompt-streaming-uses-steer-behavior ()
+  (let* ((sent-commands nil)
          (session (pi-session--create
                    :id "test-session"
                    :status 'ready
@@ -138,11 +159,15 @@
               ((symbol-function 'pi-session--touch) #'ignore)
               ((symbol-function 'pi-rpc-send)
                (lambda (_rpc command callback)
-                 (setq sent-command command)
-                 (funcall callback '(:success t))
+                 (push command sent-commands)
+                 (if (equal (cdr (assoc "type" command)) "get_state")
+                     (funcall callback '(:success t :data (:isStreaming t)))
+                   (funcall callback '(:success t)))
                  "req-test")))
       (pi-session-send-prompt session "hello"))
-    (should (equal (cdr (assoc "type" sent-command)) "prompt"))))
+    (let ((prompt-command (car sent-commands)))
+      (should (equal (cdr (assoc "type" prompt-command)) "prompt"))
+      (should (equal (cdr (assoc "streamingBehavior" prompt-command)) "steer")))))
 
 (ert-deftest pi-session-dir-resolution-current-defaults ()
   (let ((pi-session-directory nil)

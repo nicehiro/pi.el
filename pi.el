@@ -49,7 +49,6 @@
 (declare-function pi-session-set-thinking-level "pi-session" (session level &optional callback))
 (declare-function pi-session-cycle-thinking-level "pi-session" (session &optional callback))
 (declare-function pi-session-send-steer "pi-session" (session message &optional callback))
-(declare-function pi-session-send-follow-up "pi-session" (session message &optional callback))
 (declare-function pi-session-restart "pi-session" (session))
 
 (defvar pi-ui--session)
@@ -86,7 +85,6 @@
     (define-key map (kbd "o") #'pi)
     (define-key map (kbd "p") #'pi-prompt)
     (define-key map (kbd "S") #'pi-steer)
-    (define-key map (kbd "F") #'pi-follow-up)
     (define-key map (kbd "n") #'pi-new-session)
     (define-key map (kbd "R") #'pi-resume-session)
     (define-key map (kbd "f") #'pi-fork-session)
@@ -271,18 +269,6 @@ directory scope has no existing pi session, signal a user error."
          (message "pi: %s" (or (plist-get response :error)
                                "Failed to queue steering message")))))))
 
-(defun pi-follow-up (message)
-  "Queue MESSAGE as a follow-up for the current session."
-  (interactive (list (pi--read-message "Follow up after pi finishes: ")))
-  (let* ((source-buffer (pi--source-buffer))
-         (session (pi--ensure-session source-buffer)))
-    (pi-session-send-follow-up
-     session message
-     (lambda (_s response)
-       (if (pi--rpc-success-p response)
-           (message "pi: queued follow-up message")
-         (message "pi: %s" (or (plist-get response :error)
-                               "Failed to queue follow-up message")))))))
 
 (defun pi-resume-session ()
   "Select and resume a saved session for the current buffer scope."

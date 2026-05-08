@@ -1007,14 +1007,40 @@ as the initial session file to resume."
           (funcall callback session response)))))))
 
 (defun pi-session-send-prompt (session message &optional callback)
-  "Send MESSAGE through SESSION.
-Idle sends use current RPC `prompt`; streaming sends queue a `follow_up`.
+  "Send MESSAGE through SESSION using current RPC `prompt'.
+Before sending, refresh SESSION state so stale streaming state cannot turn a
+normal prompt into a queued message. If the agent is still streaming, request
+RPC `steer' delivery through `streamingBehavior'.
 CALLBACK receives `(SESSION RESPONSE)'."
-  (pi-session--send-message-command
+  (unless session
+    (user-error "No pi session selected"))
+  (pi-session--ensure-running
    session
-   (if (pi-session--streaming-p session) "follow_up" "prompt")
-   message
-   callback))
+   (lambda (_session)
+     (pi-session--request-state
+      session
+      (lambda (_session _state state-response)
+        (if (not (pi-rpc-success-p state-response))
+            (progn
+              (run-hook-with-args 'pi-session-event-hook session
+                                  (list :type "session_error"
+                                        :error (plist-get state-response :error)))
+              (when callback
+                (funcall callback session state-response)))
+          (pi-session--touch session)
+          (pi-rpc-send
+           (pi-session-rpc session)
+           `(("type" . "prompt")
+             ("message" . ,message)
+             ,@(when (pi-session--streaming-p session)
+                 '(("streamingBehavior" . "steer"))))
+           (lambda (response)
+             (when (not (pi-rpc-success-p response))
+               (run-hook-with-args 'pi-session-event-hook session
+                                   (list :type "session_error"
+                                         :error (plist-get response :error))))
+             (when callback
+               (funcall callback session response))))))))))
 
 (defun pi-session-send-steer (session message &optional callback)
   "Queue MESSAGE as current RPC `steer` in SESSION."
