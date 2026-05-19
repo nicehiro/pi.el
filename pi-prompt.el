@@ -13,6 +13,7 @@
 (require 'project)
 (require 'seq)
 (require 'subr-x)
+(require 'yank-media)
 (require 'pi-rpc)
 (require 'pi-session)
 
@@ -25,6 +26,7 @@
 (defvar pi-ui-region-context-max-chars)
 (defvar pi-ui-fallback-file-scan-max-files)
 (defvar pi-ui-fallback-file-scan-max-depth)
+(defvar pi-ui-prompt-image-directory nil)
 (defvar pi-ui--source-buffer)
 
 (defvar-local pi-ui--prompt-source-buffer nil)
@@ -39,6 +41,7 @@
     (define-key map (kbd "C-c C-c") #'pi-ui-prompt-submit)
     (define-key map (kbd "C-c C-k") #'pi-ui-prompt-cancel)
     (define-key map (kbd "C-c C-f") #'pi-ui-prompt-insert-file-reference)
+    (define-key map (kbd "C-c C-i") #'pi-ui-prompt-yank-image)
     (define-key map (kbd "C-c C-s") #'pi-ui-prompt-insert-command)
     (define-key map (kbd "TAB") #'completion-at-point)
     map)
@@ -47,13 +50,14 @@
 (define-derived-mode pi-prompt-buffer-mode text-mode "Pi-Prompt"
   "Major mode for composing longer pi prompts."
   (setq-local header-line-format
-              "Pi prompt: C-c C-c send • C-c C-k cancel • C-c C-f @file • C-c C-s /command")
+              "Pi prompt: C-c C-c send • C-c C-k cancel • C-c C-f @file • C-c C-i image • C-c C-s /command")
   (setq-local pi-ui--prompt-source-buffer nil)
   (setq-local pi-ui--prompt-source-window nil)
   (setq-local pi-ui--prompt-file-cache nil)
   (setq-local pi-ui--prompt-command-cache nil)
   (setq-local pi-ui--prompt-command-metadata nil)
   (setq-local pi-ui--prompt-command-loading nil)
+  (yank-media-handler "image/.*" #'pi-ui-prompt--yank-image-handler)
   (add-hook 'completion-at-point-functions #'pi-ui--prompt-completion-at-point nil t))
 
 (defun pi-ui--prompt-source-root (source-buffer)
@@ -224,6 +228,67 @@
 (defun pi-ui--prompt-completion-at-point ()
   (or (pi-ui--prompt-command-capf)
       (pi-ui--prompt-file-reference-capf)))
+
+(defun pi-ui-prompt--image-extension (mime-type)
+  "Return a file extension for image MIME-TYPE."
+  (pcase (symbol-name mime-type)
+    ("image/png" "png")
+    ("image/jpeg" "jpg")
+    ("image/jpg" "jpg")
+    ("image/gif" "gif")
+    ("image/webp" "webp")
+    ("image/svg+xml" "svg")
+    ("image/tiff" "tiff")
+    (mime
+     (replace-regexp-in-string
+      "[^[:alnum:]]+" "-"
+      (or (cadr (split-string mime "/")) "image")))))
+
+(defun pi-ui-prompt--image-file (mime-type)
+  "Return a fresh temp image path for MIME-TYPE."
+  (let ((dir (file-name-as-directory
+              (expand-file-name (or pi-ui-prompt-image-directory
+                                    temporary-file-directory)))))
+    (make-directory dir t)
+    (make-temp-file (expand-file-name "pi-clipboard-" dir) nil
+                    (concat "." (pi-ui-prompt--image-extension mime-type)))))
+
+(defun pi-ui-prompt--write-binary-file (path data)
+  "Write DATA to PATH without text coding conversion."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert (if (multibyte-string-p data)
+                (string-as-unibyte data)
+              data))
+    (let ((coding-system-for-write 'binary))
+      (write-region (point-min) (point-max) path nil 'silent))))
+
+(defun pi-ui-prompt--insert-file-reference (path)
+  "Insert PATH as a pi @file reference at point."
+  (unless (or (bobp)
+              (memq (char-before) '(?\s ?\t ?\n)))
+    (insert " "))
+  (insert "@" path)
+  (unless (or (eobp)
+              (memq (char-after) '(?\s ?\t ?\n)))
+    (insert " ")))
+
+(defun pi-ui-prompt--yank-image-handler (mime-type data)
+  "Save clipboard image DATA with MIME-TYPE and insert an @file reference."
+  (unless (derived-mode-p 'pi-prompt-buffer-mode)
+    (user-error "Not in a pi prompt buffer"))
+  (let ((path (pi-ui-prompt--image-file mime-type)))
+    (pi-ui-prompt--write-binary-file path data)
+    (pi-ui-prompt--insert-file-reference path)
+    (message "pi: inserted clipboard image %s" path)))
+
+(defun pi-ui-prompt-yank-image (&optional choose-type)
+  "Paste an image from the clipboard into the prompt as a temp @file reference.
+With prefix argument CHOOSE-TYPE, ask which available clipboard media type to use."
+  (interactive "P")
+  (unless (derived-mode-p 'pi-prompt-buffer-mode)
+    (user-error "Not in a pi prompt buffer"))
+  (yank-media choose-type))
 
 (defun pi-ui-prompt-insert-command ()
   "Insert a /command with completion."

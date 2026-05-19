@@ -92,6 +92,12 @@ Lower values feel more immediate but may increase UI load."
   "Maximum directory depth for @file completion outside projects."
   :type 'integer)
 
+(defcustom pi-ui-prompt-image-directory nil
+  "Directory for temporary clipboard images inserted into pi prompt buffers.
+When nil, use `temporary-file-directory'."
+  :type '(choice (const :tag "Use system temp directory" nil)
+                 directory))
+
 (defface pi-ui-session-title-face
   '((t :inherit font-lock-keyword-face :weight bold :height 1.1))
   "Face for session buffer titles."
