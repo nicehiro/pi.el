@@ -22,6 +22,7 @@
 
 (declare-function pi-rpc-success-p "pi-rpc" (response))
 (declare-function pi-session-buffer-mode "pi-session-buffer" ())
+(declare-function pi-session--request-state "pi-session" (session callback))
 (declare-function pi-steer "pi" (message))
 (declare-function pi-toggle-auto-compaction "pi" ())
 (declare-function pi-toggle-auto-retry "pi" ())
@@ -528,6 +529,18 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
                                (format ": %s" (pi-ui--truncate-inline error 120))
                              "")))))))
 
+(defun pi-ui--refresh-session-state-and-render (session buffer &optional after-refresh)
+  "Refresh SESSION state once, update BUFFER's header, then call AFTER-REFRESH."
+  (when (buffer-live-p buffer)
+    (pi-session--request-state
+     session
+     (lambda (_session _state _response)
+       (when (buffer-live-p buffer)
+         (pi-ui--update-session-header-line buffer)
+         (if after-refresh
+             (funcall after-refresh)
+           (pi-ui--buffer-render buffer)))))))
+
 (defun pi-ui--tool-result-from-event (event)
   (let* ((result (or (plist-get event :result)
                      (plist-get event :partialResult)))
@@ -560,6 +573,8 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
                        (pi-ui--ensure-buffer session)))))
     (when (buffer-live-p buffer)
       (pcase event-type
+        ("agent_start"
+         (pi-ui--update-session-header-line buffer))
         ("message_start"
          (when (equal (pi-ui--event-message-role event) "assistant")
            (with-current-buffer buffer
@@ -578,7 +593,8 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
              ("assistant"
               (with-current-buffer buffer
                 (setq-local pi-ui--live-message message))
-              (pi-ui--schedule-render buffer t))
+              (pi-ui--schedule-render buffer t)
+              (pi-ui--refresh-session-state-and-render session buffer))
              ("user"
               (pi-ui--append-history-message buffer message))
              ("toolResult" nil))))
@@ -605,7 +621,11 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
            (message "pi: %s" text)
            (pi-ui--append-transient buffer (list :kind 'error :text text))))
         ("agent_end"
-         (pi-ui--refresh-session-buffer session buffer))
+         (pi-ui--update-session-header-line buffer)
+         (pi-ui--refresh-session-state-and-render
+          session buffer
+          (lambda ()
+            (pi-ui--refresh-session-buffer session buffer))))
         (_ nil)))))
 
 (defun pi-ui-toggle-tool-display-style ()
