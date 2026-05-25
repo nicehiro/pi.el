@@ -1,6 +1,6 @@
 # pi.el
 
-`pi.el` is a terminal-free Emacs frontend for the [`pi`](https://github.com/mariozechner/pi-coding-agent) coding agent.
+`pi.el` is a terminal-free Emacs frontend for the [`pi`](https://github.com/earendil-works/pi) coding agent.
 
 It starts hidden `pi --mode rpc` subprocesses, keeps one session per project or directory scope, and renders conversation output in Emacs side windows. The package is meant to stay lightweight, editor-native, and easy to use from the buffer you are already working in.
 
@@ -8,7 +8,7 @@ It starts hidden `pi --mode rpc` subprocesses, keeps one session per project or 
 
 ## Status
 
-Early and evolving. This package targets `@mariozechner/pi-coding-agent` 0.73.0 or newer and intentionally follows the current RPC protocol without compatibility shims for older pi releases.
+Early and evolving. This package targets `@earendil-works/pi-coding-agent` 0.73.0 or newer and intentionally follows the current RPC protocol without compatibility shims for older pi releases.
 
 ## Features
 
