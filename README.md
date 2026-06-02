@@ -15,7 +15,7 @@ Early and evolving. This package targets `@earendil-works/pi-coding-agent` 0.73.
 - terminal-free RPC integration with `pi --mode rpc`
 - one hidden pi session per project root or directory scope
 - side-window session buffer with live streaming output
-- prompt composer buffer with editor-native editing
+- prompt composer buffer with editor-native editing, defaulting to `org-mode`
 - `@file` completion from project files
 - `/command` completion from the running pi session
 - saved session resume support
@@ -33,6 +33,14 @@ The current package centers on a scope-bound session buffer:
 3. send it to the hidden pi RPC process
 4. watch streamed output in a side window
 5. continue the conversation, resume old sessions, or switch models as needed
+
+## Configuration
+
+Prompt composer buffers use `org-mode` by default. Set `pi-ui-prompt-major-mode` to another major mode, for example:
+
+```elisp
+(setq pi-ui-prompt-major-mode #'markdown-mode)
+```
 
 ## Difference from `dnouri/pi-coding-agent`
 

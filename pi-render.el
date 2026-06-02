@@ -96,6 +96,14 @@
     (let* ((state (pi-session-cached-state session))
            (items nil))
       (push (cond
+             ((and (not (pi-rpc-json-truthy-p (plist-get state :is-streaming)))
+                   (let ((error-message (plist-get state :last-error)))
+                     (and (stringp error-message)
+                          (not (string-empty-p error-message)))))
+              (format "⚠ Error: %s"
+                      (pi-ui--truncate-inline (plist-get state :last-error) 80)))
+             ((eq (pi-session-status session) 'dead)
+              "✕ Stopped")
              ((pi-rpc-json-truthy-p (plist-get state :is-compacting))
               (format "%s Compacting" (pi-ui--spinner-frame)))
              ((pi-rpc-json-truthy-p (plist-get state :is-retrying))
@@ -164,6 +172,12 @@
          (let ((text (plist-get block :text)))
            (unless (string-empty-p (or text ""))
              (push text pieces))))))
+    (when-let* ((error-message (plist-get message :errorMessage))
+                ((stringp error-message))
+                ((not (string-empty-p error-message))))
+      (push (propertize (format "Assistant error: %s" error-message)
+                        'face 'error)
+            pieces))
     (string-join (nreverse pieces) "\n\n")))
 
 (defun pi-ui--display-text (text)

@@ -756,6 +756,24 @@ The plist keys are :kind, :root, :name, and :key."
        (setq state (plist-put state :retry-max-attempts nil))))
     (setf (pi-session-cached-state session) state)))
 
+(defun pi-session--apply-assistant-message-end (session event)
+  "Update SESSION cached state from assistant message_end EVENT."
+  (let* ((message (plist-get event :message))
+         (role (plist-get message :role))
+         (stop-reason (plist-get message :stopReason))
+         (error-message (plist-get message :errorMessage))
+         (state (pi-session-cached-state session)))
+    (when (equal role "assistant")
+      (when (member stop-reason '("stop" "length" "error" "aborted"))
+        (setq state (plist-put state :is-streaming nil)))
+      (if (and (equal stop-reason "error")
+               (stringp error-message)
+               (not (string-empty-p error-message)))
+          (setq state (plist-put state :last-error error-message))
+        (when (not (equal stop-reason "toolUse"))
+          (setq state (plist-put state :last-error nil))))
+      (setf (pi-session-cached-state session) state))))
+
 (defun pi-session--should-keepalive-p (session)
   (and pi-session-keepalive-predicate
        (funcall pi-session-keepalive-predicate session)))
@@ -777,8 +795,12 @@ The plist keys are :kind, :root, :name, and :key."
 
 (defun pi-session--event-dispatch (session event)
   (pcase (plist-get event :type)
-    ("agent_start" (pi-session--set-streaming session t))
+    ("agent_start"
+     (pi-session--set-streaming session t)
+     (setf (pi-session-cached-state session)
+           (plist-put (pi-session-cached-state session) :last-error nil)))
     ("agent_end" (pi-session--set-streaming session nil))
+    ("message_end" (pi-session--apply-assistant-message-end session event))
     ("queue_update" (pi-session--apply-queue-update session event))
     ((or "compaction_start" "compaction_end")
      (pi-session--apply-compaction-event session event))
@@ -835,6 +857,8 @@ The plist keys are :kind, :root, :name, and :key."
                ((plist-member previous-state state-key)
                 (plist-put state state-key (plist-get previous-state state-key)))
                (t state)))))
+    (when (plist-member previous-state :last-error)
+      (setq state (plist-put state :last-error (plist-get previous-state :last-error))))
     (setf (pi-session-cached-state session) state
           (pi-session-session-file session) (plist-get state :session-file)
           (pi-session-session-id session) (plist-get state :session-id))
@@ -867,10 +891,16 @@ The plist keys are :kind, :root, :name, and :key."
                             :error message)))
 
 (defun pi-session--exit-handler (session _rpc event)
-  (pi-session--set-streaming session nil)
-  (pi-session--clear-ready-callbacks session)
-  (setf (pi-session-status session) 'dead
-        (pi-session-rpc session) nil)
+  (let ((intentional-stop (eq (pi-session-status session) 'stopped)))
+    (pi-session--set-streaming session nil)
+    (setf (pi-session-cached-state session)
+          (plist-put (pi-session-cached-state session)
+                     :last-error
+                     (unless intentional-stop
+                       (string-trim (or event "process exited")))))
+    (pi-session--clear-ready-callbacks session)
+    (setf (pi-session-status session) (if intentional-stop 'stopped 'dead)
+          (pi-session-rpc session) nil))
   (run-hook-with-args 'pi-session-event-hook session
                       (list :type "session_exit"
                             :event event)))
@@ -1313,6 +1343,20 @@ CALLBACK receives `(SESSION RESPONSE)'."
         (when callback
           (funcall callback session response)))))))
 
+(defun pi-session-get-state (session callback)
+  "Load current RPC state for SESSION.
+CALLBACK receives `(SESSION RESPONSE)'."
+  (unless session
+    (user-error "No pi session selected"))
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-session--request-state
+      session
+      (lambda (_s _state response)
+        (when callback
+          (funcall callback session response)))))))
+
 (defun pi-session-get-last-assistant-text (session callback)
   "Load the last assistant text for SESSION."
   (pi-session--ensure-running
@@ -1447,11 +1491,13 @@ When SILENT is non-nil, do not show a message."
     (user-error "No pi session selected"))
   (pi-session--cancel-idle-timer session)
   (pi-session--clear-ready-callbacks session)
+  (setf (pi-session-status session) 'stopped)
   (when-let* ((rpc (pi-session-rpc session)))
     (when (pi-rpc-live-p rpc)
       (pi-rpc-stop rpc)))
-  (setf (pi-session-status session) 'stopped
-        (pi-session-rpc session) nil)
+  (setf (pi-session-rpc session) nil
+        (pi-session-cached-state session)
+        (plist-put (pi-session-cached-state session) :last-error nil))
   (unless silent
     (message "Killed pi session: %s" (pi-session-display-name session)))
   session)

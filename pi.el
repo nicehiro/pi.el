@@ -42,6 +42,7 @@
 (declare-function pi-session-set-auto-retry "pi-session" (session enabled &optional callback))
 (declare-function pi-session-abort-retry "pi-session" (session &optional callback))
 (declare-function pi-session-get-session-stats "pi-session" (session callback))
+(declare-function pi-session-get-state "pi-session" (session callback))
 (declare-function pi-session-get-last-assistant-text "pi-session" (session callback))
 (declare-function pi-session-export-html "pi-session" (session &optional output-path callback))
 (declare-function pi-session-set-model "pi-session" (session provider model-id &optional callback))
@@ -95,6 +96,7 @@
     (define-key map (kbd "M-a") #'pi-abort-retry)
     (define-key map (kbd "a") #'pi-abort)
     (define-key map (kbd "e") #'pi-export-session-html)
+    (define-key map (kbd "i") #'pi-status)
     (define-key map (kbd "j") #'pi-tree)
     (define-key map (kbd "m") #'pi-cycle-model)
     (define-key map (kbd "s") #'pi-set-model)
@@ -570,6 +572,43 @@ With optional INSTRUCTIONS, pass custom compaction guidance."
            (message "pi: %s" (pi--format-session-stats (plist-get response :data)))
          (message "pi: %s" (or (plist-get response :error)
                                "Failed to load session stats")))))))
+
+(defun pi--format-runtime-state (state)
+  (cond
+   ((pi-rpc-json-truthy-p (plist-get state :is-compacting)) "compacting")
+   ((pi-rpc-json-truthy-p (plist-get state :is-retrying)) "retrying")
+   ((pi-rpc-json-truthy-p (plist-get state :is-streaming)) "working")
+   (t "idle")))
+
+(defun pi-status ()
+  "Show current pi RPC process and session state once."
+  (interactive)
+  (let* ((source-buffer (pi--source-buffer))
+         (session (or (and (derived-mode-p 'pi-session-buffer-mode)
+                           (bound-and-true-p pi-ui--session))
+                      (pi-session-current-for-buffer source-buffer))))
+    (unless session
+      (user-error "pi: no existing session for this scope"))
+    (let ((rpc (pi-session-rpc session)))
+      (if (not (and rpc (pi-rpc-live-p rpc)))
+          (message "pi: backend %s for %s; use M-x pi-reload-session to restart"
+                   (pi-session-status session)
+                   (pi-session-display-name session))
+        (pi-session-get-state
+         session
+         (lambda (_s response)
+           (if (not (pi--rpc-success-p response))
+               (message "pi: status check failed: %s"
+                        (or (plist-get response :error) "unknown error"))
+             (let* ((state (plist-get response :data))
+                    (cached (pi-session-cached-state session))
+                    (model (or (pi--model-name (plist-get state :model)) "unknown"))
+                    (runtime (pi--format-runtime-state cached))
+                    (messages (or (plist-get state :messageCount)
+                                  (plist-get cached :message-count)
+                                  "?")))
+               (message "pi: backend alive, %s, %s messages, model %s"
+                        runtime messages model)))))))))
 
 (defun pi-last-assistant-text ()
   "Copy the current session's last assistant text to the kill ring."

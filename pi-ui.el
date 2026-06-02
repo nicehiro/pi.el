@@ -98,6 +98,13 @@ When nil, use `temporary-file-directory'."
   :type '(choice (const :tag "Use system temp directory" nil)
                  directory))
 
+(defcustom pi-ui-prompt-major-mode #'org-mode
+  "Major mode used in pi prompt composer buffers."
+  :type '(choice (const :tag "Org mode" org-mode)
+                 (const :tag "Markdown mode" markdown-mode)
+                 (const :tag "Text mode" text-mode)
+                 function))
+
 (defface pi-ui-session-title-face
   '((t :inherit font-lock-keyword-face :weight bold :height 1.1))
   "Face for session buffer titles."

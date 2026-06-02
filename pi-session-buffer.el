@@ -179,7 +179,7 @@
     (with-current-buffer buffer
       (not (or (minibufferp)
                (derived-mode-p 'pi-session-buffer-mode)
-               (derived-mode-p 'pi-prompt-buffer-mode))))))
+               (pi-ui--prompt-buffer-p))))))
 
 (defun pi-ui--follow-current-buffer ()
   (when (bound-and-true-p pi-ui-follow-current-buffer)

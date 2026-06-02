@@ -22,6 +22,7 @@
 
 (defvar pi-ui-prompt-window-side)
 (defvar pi-ui-prompt-window-size)
+(defvar pi-ui-prompt-major-mode #'org-mode)
 (defvar pi-ui-include-active-region)
 (defvar pi-ui-region-context-max-chars)
 (defvar pi-ui-fallback-file-scan-max-files)
@@ -35,8 +36,9 @@
 (defvar-local pi-ui--prompt-command-cache nil)
 (defvar-local pi-ui--prompt-command-metadata nil)
 (defvar-local pi-ui--prompt-command-loading nil)
+(defvar-local pi-ui--prompt-buffer-p nil)
 
-(defvar pi-prompt-buffer-mode-map
+(defvar pi-prompt-composer-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'pi-ui-prompt-submit)
     (define-key map (kbd "C-c C-k") #'pi-ui-prompt-cancel)
@@ -45,20 +47,49 @@
     (define-key map (kbd "C-c C-s") #'pi-ui-prompt-insert-command)
     (define-key map (kbd "TAB") #'completion-at-point)
     map)
-  "Keymap for `pi-prompt-buffer-mode'.")
+  "Keymap for `pi-prompt-composer-mode'.")
 
-(define-derived-mode pi-prompt-buffer-mode text-mode "Pi-Prompt"
-  "Major mode for composing longer pi prompts."
-  (setq-local header-line-format
-              "Pi prompt: C-c C-c send • C-c C-k cancel • C-c C-f @file • C-c C-i image • C-c C-s /command")
-  (setq-local pi-ui--prompt-source-buffer nil)
-  (setq-local pi-ui--prompt-source-window nil)
-  (setq-local pi-ui--prompt-file-cache nil)
-  (setq-local pi-ui--prompt-command-cache nil)
-  (setq-local pi-ui--prompt-command-metadata nil)
-  (setq-local pi-ui--prompt-command-loading nil)
-  (yank-media-handler "image/.*" #'pi-ui-prompt--yank-image-handler)
-  (add-hook 'completion-at-point-functions #'pi-ui--prompt-completion-at-point nil t))
+(define-minor-mode pi-prompt-composer-mode
+  "Minor mode for composing longer pi prompts."
+  :lighter " Pi-Prompt"
+  :keymap pi-prompt-composer-mode-map
+  (if pi-prompt-composer-mode
+      (progn
+        (setq-local pi-ui--prompt-buffer-p t)
+        (setq-local header-line-format
+                    "Pi prompt: C-c C-c send • C-c C-k cancel • C-c C-f @file • C-c C-i image • C-c C-s /command")
+        (yank-media-handler "image/.*" #'pi-ui-prompt--yank-image-handler)
+        (add-hook 'completion-at-point-functions #'pi-ui--prompt-completion-at-point nil t))
+    (setq-local pi-ui--prompt-buffer-p nil)
+    (kill-local-variable 'header-line-format)
+    (remove-hook 'completion-at-point-functions #'pi-ui--prompt-completion-at-point t)))
+
+(defun pi-ui--prompt-buffer-p ()
+  "Return non-nil when the current buffer is a pi prompt composer."
+  pi-ui--prompt-buffer-p)
+
+(defun pi-ui--ensure-prompt-buffer ()
+  "Signal an error unless the current buffer is a pi prompt composer."
+  (unless (pi-ui--prompt-buffer-p)
+    (user-error "Not in a pi prompt buffer")))
+
+(defun pi-ui--prompt-major-mode-function ()
+  "Return the configured prompt major mode function."
+  (let ((mode pi-ui-prompt-major-mode))
+    (unless (functionp mode)
+      (user-error "pi-ui-prompt-major-mode is not a function: %S" mode))
+    mode))
+
+(defun pi-ui--activate-prompt-major-mode ()
+  "Activate the configured major mode for the current prompt buffer."
+  (let ((mode (pi-ui--prompt-major-mode-function)))
+    (funcall mode)))
+
+(defun pi-prompt-buffer-mode ()
+  "Activate the configured pi prompt major mode and prompt composer minor mode."
+  (interactive)
+  (pi-ui--activate-prompt-major-mode)
+  (pi-prompt-composer-mode 1))
 
 (defun pi-ui--prompt-source-root (source-buffer)
   (or (and (buffer-live-p source-buffer)
@@ -79,6 +110,13 @@
               (buffer-name source-buffer)
             "detached")))
 
+(defun pi-ui--prompt-code-block (text &optional language)
+  "Return TEXT wrapped in a code block for the configured prompt major mode."
+  (let ((language (or language "text")))
+    (if (eq (pi-ui--prompt-major-mode-function) #'org-mode)
+        (format "#+begin_src %s\n%s\n#+end_src" language text)
+      (format "```%s\n%s\n```" language text))))
+
 (defun pi-ui--capture-region-context (source-buffer)
   (when (and pi-ui-include-active-region (buffer-live-p source-buffer))
     (with-current-buffer source-buffer
@@ -95,12 +133,11 @@
                (source-name (pi-ui--prompt-source-name source-buffer)))
           (concat
            (format "Selected context (%s:%d-%d):\n" source-name line-beg line-end)
-           "```text\n"
-           text
-           (if truncated
-               (format "\n... [truncated to %d chars]" pi-ui-region-context-max-chars)
-             "")
-           "\n```"))))))
+           (pi-ui--prompt-code-block
+            (concat text
+                    (if truncated
+                        (format "\n... [truncated to %d chars]" pi-ui-region-context-max-chars)
+                      "")))))))))
 
 (defun pi-ui--display-prompt-buffer (buffer)
   (display-buffer-in-side-window
@@ -275,8 +312,7 @@
 
 (defun pi-ui-prompt--yank-image-handler (mime-type data)
   "Save clipboard image DATA with MIME-TYPE and insert an @file reference."
-  (unless (derived-mode-p 'pi-prompt-buffer-mode)
-    (user-error "Not in a pi prompt buffer"))
+  (pi-ui--ensure-prompt-buffer)
   (let ((path (pi-ui-prompt--image-file mime-type)))
     (pi-ui-prompt--write-binary-file path data)
     (pi-ui-prompt--insert-file-reference path)
@@ -286,15 +322,13 @@
   "Paste an image from the clipboard into the prompt as a temp @file reference.
 With prefix argument CHOOSE-TYPE, ask which available clipboard media type to use."
   (interactive "P")
-  (unless (derived-mode-p 'pi-prompt-buffer-mode)
-    (user-error "Not in a pi prompt buffer"))
+  (pi-ui--ensure-prompt-buffer)
   (yank-media choose-type))
 
 (defun pi-ui-prompt-insert-command ()
   "Insert a /command with completion."
   (interactive)
-  (unless (derived-mode-p 'pi-prompt-buffer-mode)
-    (user-error "Not in a pi prompt buffer"))
+  (pi-ui--ensure-prompt-buffer)
   (unless (or pi-ui--prompt-command-cache pi-ui--prompt-command-loading)
     (pi-ui--prompt-prefetch-commands (current-buffer) pi-ui--prompt-source-buffer))
   (when pi-ui--prompt-command-loading
@@ -313,8 +347,7 @@ With prefix argument CHOOSE-TYPE, ask which available clipboard media type to us
 (defun pi-ui-prompt-insert-file-reference ()
   "Insert an @file reference with completion."
   (interactive)
-  (unless (derived-mode-p 'pi-prompt-buffer-mode)
-    (user-error "Not in a pi prompt buffer"))
+  (pi-ui--ensure-prompt-buffer)
   (let* ((files (pi-ui--prompt-file-candidates))
          (choice (completing-read "File reference: " files nil t))
          (bounds (pi-ui--prompt-file-reference-bounds)))
@@ -334,8 +367,7 @@ With prefix argument CHOOSE-TYPE, ask which available clipboard media type to us
 (defun pi-ui-prompt-submit ()
   "Submit the current prompt buffer content."
   (interactive)
-  (unless (derived-mode-p 'pi-prompt-buffer-mode)
-    (user-error "Not in a pi prompt buffer"))
+  (pi-ui--ensure-prompt-buffer)
   (let* ((prompt-buffer (current-buffer))
          (prompt-window (get-buffer-window prompt-buffer t))
          (source-buffer pi-ui--prompt-source-buffer)

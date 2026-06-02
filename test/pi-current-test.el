@@ -71,6 +71,15 @@
     (should-not (string-match-p "\\[38;5;116m" rendered))
     (should-not (string-match-p "\33" rendered))))
 
+(ert-deftest pi-render-assistant-error-message-is-visible ()
+  (let ((rendered (pi-ui--render-message
+                   '(:role "assistant"
+                     :content nil
+                     :stopReason "error"
+                     :errorMessage "stream_read_error"))))
+    (should (string-match-p "Assistant" rendered))
+    (should (string-match-p "Assistant error: stream_read_error" rendered))))
+
 (ert-deftest pi-thinking-level-map-filters-supported-levels ()
   (let ((model '(:thinkingLevelMap (:off t :minimal :json-false :low t :medium t :high :json-false))))
     (should (equal (pi--supported-thinking-levels model)
@@ -126,6 +135,20 @@
               :sessionId "sid")))
     (should (eq (plist-get (pi-session-cached-state session) :auto-retry-enabled) t))
     (should (eq (plist-get (pi-session-cached-state session) :is-retrying) t))))
+
+(ert-deftest pi-session-message-end-error-clears-streaming-state ()
+  (let ((session (pi-session--create
+                  :id "test-session"
+                  :cached-state '(:is-streaming t))))
+    (pi-session--apply-assistant-message-end
+     session
+     '(:type "message_end"
+       :message (:role "assistant"
+                 :stopReason "error"
+                 :errorMessage "stream_read_error")))
+    (should-not (plist-get (pi-session-cached-state session) :is-streaming))
+    (should (equal (plist-get (pi-session-cached-state session) :last-error)
+                   "stream_read_error"))))
 
 (ert-deftest pi-session-send-prompt-refreshes-state-before-prompt ()
   (let* ((sent-commands nil)
