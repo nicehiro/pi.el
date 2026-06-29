@@ -30,7 +30,7 @@
   "Whether to create an internal process buffer for each RPC subprocess."
   :type 'boolean)
 
-(defconst pi-rpc-minimum-pi-version "0.73.0"
+(defconst pi-rpc-minimum-pi-version "0.80.0"
   "Minimum supported pi coding agent version.")
 
 (defvar pi-rpc--version-check-cache nil
@@ -41,6 +41,8 @@
                (:copier nil))
   process
   buffer
+  stderr-buffer
+  debug-buffer-p
   (next-id 0)
   pending-by-id
   event-handler
@@ -57,6 +59,11 @@
   "Create the internal process buffer for NAME if enabled."
   (when pi-rpc-debug-buffer
     (generate-new-buffer (format " *pi-rpc:%s*" name))))
+
+(defun pi-rpc--make-stderr-buffer (name)
+  "Create the internal stderr buffer for NAME.
+RPC stdout must stay JSONL-only; stderr always needs a separate sink."
+  (generate-new-buffer (format " *pi-rpc-stderr:%s*" name)))
 
 (defun pi-rpc--version-from-output (output)
   "Extract a semantic version from pi --version OUTPUT."
@@ -196,6 +203,9 @@ COMMAND may be an alist or plist."
           (pi-rpc--flush-line rpc fragment)
           (setf (pi-rpc-stdout-fragment rpc) nil)))
       (pi-rpc--fail-pending rpc (string-trim event))
+      (when (and (not (pi-rpc-debug-buffer-p rpc))
+                 (buffer-live-p (pi-rpc-stderr-buffer rpc)))
+        (kill-buffer (pi-rpc-stderr-buffer rpc)))
       (pi-rpc--call-handler (pi-rpc-exit-handler rpc) rpc event))))
 
 (defun pi-rpc-start (cwd &optional name on-event on-exit)
@@ -204,23 +214,28 @@ NAME is used for the internal process and buffer names.
 ON-EVENT receives (RPC EVENT).
 ON-EXIT receives (RPC EVENT)."
   (pi-rpc-check-version)
-  (let* ((default-directory (file-name-as-directory (expand-file-name cwd)))
-         (buffer (pi-rpc--make-process-buffer (or name "default")))
+  (let* ((process-name (or name "default"))
+         (default-directory (file-name-as-directory (expand-file-name cwd)))
+         (buffer (pi-rpc--make-process-buffer process-name))
+         (stderr-buffer (pi-rpc--make-stderr-buffer process-name))
          (rpc (pi-rpc--create
                :buffer buffer
+               :stderr-buffer stderr-buffer
+               :debug-buffer-p pi-rpc-debug-buffer
                :pending-by-id (make-hash-table :test #'equal)
                :event-handler on-event
                :exit-handler on-exit
                :stdout-fragment ""
                :alive-p t))
          (process (make-process
-                   :name (format "pi-rpc-%s" (or name "default"))
+                   :name (format "pi-rpc-%s" process-name)
                    :buffer buffer
                    :command (append (list pi-rpc-executable "--mode" "rpc")
                                     pi-rpc-extra-args)
                    :coding 'utf-8-unix
                    :connection-type 'pipe
                    :noquery t
+                   :stderr stderr-buffer
                    :filter #'pi-rpc--process-filter
                    :sentinel #'pi-rpc--process-sentinel)))
     (set-process-query-on-exit-flag process nil)
@@ -232,6 +247,10 @@ ON-EXIT receives (RPC EVENT)."
   "Stop RPC subprocess RPC."
   (when (and rpc (process-live-p (pi-rpc-process rpc)))
     (delete-process (pi-rpc-process rpc)))
+  (when (and rpc
+             (not (pi-rpc-debug-buffer-p rpc))
+             (buffer-live-p (pi-rpc-stderr-buffer rpc)))
+    (kill-buffer (pi-rpc-stderr-buffer rpc)))
   (setf (pi-rpc-alive-p rpc) nil)
   t)
 

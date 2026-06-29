@@ -42,6 +42,31 @@
       (when (process-live-p process)
         (delete-process process)))))
 
+(ert-deftest pi-rpc-start-keeps-stderr-out-of-jsonl-filter ()
+  (let (captured-args
+        rpc)
+    (let ((pi-rpc-debug-buffer t))
+      (cl-letf (((symbol-function 'pi-rpc-check-version) #'ignore)
+                ((symbol-function 'make-process)
+                 (lambda (&rest args)
+                   (setq captured-args args)
+                   'fake-process))
+                ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
+                ((symbol-function 'process-put) #'ignore))
+        (unwind-protect
+            (progn
+              (setq rpc (pi-rpc-start default-directory "stderr-test"))
+              (should (buffer-live-p (plist-get captured-args :buffer)))
+              (should (buffer-live-p (plist-get captured-args :stderr)))
+              (should-not (eq (plist-get captured-args :stderr)
+                              (plist-get captured-args :buffer)))
+              (should (eq (pi-rpc-stderr-buffer rpc)
+                          (plist-get captured-args :stderr))))
+          (when (and rpc (buffer-live-p (pi-rpc-buffer rpc)))
+            (kill-buffer (pi-rpc-buffer rpc)))
+          (when (and rpc (buffer-live-p (pi-rpc-stderr-buffer rpc)))
+            (kill-buffer (pi-rpc-stderr-buffer rpc))))))))
+
 (ert-deftest pi-rpc-message-update-uses-current-assistant-event-shape ()
   (should (pi-ui--message-update-assistant-p
            '(:type "message_update"
@@ -79,6 +104,13 @@
                      :errorMessage "stream_read_error"))))
     (should (string-match-p "Assistant" rendered))
     (should (string-match-p "Assistant error: stream_read_error" rendered))))
+
+(ert-deftest pi-render-compaction-summary-includes-estimated-tokens-after ()
+  (should (equal (pi-ui--compaction-result-summary
+                  '(:tokensBefore 150000
+                    :estimatedTokensAfter 32000
+                    :firstKeptEntryId "abcdef123456"))
+                 "150000 -> ~32000 tokens, kept from abcdef12")))
 
 (ert-deftest pi-thinking-level-map-filters-supported-levels ()
   (let ((model '(:thinkingLevelMap (:off t :minimal :json-false :low t :medium t :high :json-false))))

@@ -467,8 +467,15 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
 
 (defun pi-ui--compaction-result-summary (result)
   (let ((parts nil))
-    (when-let* ((tokens (plist-get result :tokensBefore)))
-      (push (pi-ui--format-count tokens "token" "tokens") parts))
+    (let ((tokens-before (plist-get result :tokensBefore))
+          (tokens-after (plist-get result :estimatedTokensAfter)))
+      (cond
+       ((and (numberp tokens-before) (numberp tokens-after))
+        (push (format "%s -> ~%s tokens" tokens-before tokens-after) parts))
+       ((numberp tokens-before)
+        (push (pi-ui--format-count tokens-before "token" "tokens") parts))
+       ((numberp tokens-after)
+        (push (format "~%s tokens after compaction" tokens-after) parts))))
     (when-let* ((entry-id (plist-get result :firstKeptEntryId))
                 ((stringp entry-id))
                 ((not (string-empty-p entry-id))))
