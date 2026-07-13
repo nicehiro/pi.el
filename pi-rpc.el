@@ -30,7 +30,7 @@
   "Whether to create an internal process buffer for each RPC subprocess."
   :type 'boolean)
 
-(defconst pi-rpc-minimum-pi-version "0.80.0"
+(defconst pi-rpc-minimum-pi-version "0.80.4"
   "Minimum supported pi coding agent version.")
 
 (defvar pi-rpc--version-check-cache nil

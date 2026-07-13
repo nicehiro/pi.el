@@ -86,6 +86,11 @@ transcripts just to show picker labels."
 (defvar pi-session--next-id 0)
 (defvar pi-session--active-index :uninitialized)
 
+(defconst pi-session--locally-owned-state-keys
+  '(:last-error :is-retrying :retry-attempt :retry-max-attempts
+    :auto-retry-enabled)
+  "Cached state keys maintained from local commands and RPC events.")
+
 (defun pi-session--next-id ()
   (setq pi-session--next-id (1+ pi-session--next-id))
   (format "session-%d" pi-session--next-id))
@@ -373,18 +378,17 @@ transcripts just to show picker labels."
        "[title: empty]"))
     (_ (format "[%s]" (plist-get entry :type)))))
 
-(defun pi-session--resolved-label-state (records)
+(defun pi-session--resolved-label-state (entries)
   (let ((labels (make-hash-table :test #'equal)))
-    (dolist (record records labels)
-      (let* ((entry (plist-get record :entry)))
-        (when (equal (plist-get entry :type) "label")
-          (let ((target-id (plist-get entry :targetId))
-                (label (plist-get entry :label)))
-            (if (and (stringp label) (not (string-empty-p label)))
-                (puthash target-id
-                         (list :label label :timestamp (plist-get entry :timestamp))
-                         labels)
-              (remhash target-id labels))))))))
+    (dolist (entry entries labels)
+      (when (equal (plist-get entry :type) "label")
+        (let ((target-id (plist-get entry :targetId))
+              (label (plist-get entry :label)))
+          (if (and (stringp label) (not (string-empty-p label)))
+              (puthash target-id
+                       (list :label label :timestamp (plist-get entry :timestamp))
+                       labels)
+            (remhash target-id labels)))))))
 
 (defun pi-session--visible-ancestor-id (entry by-id visible-ids)
   (let ((parent-id (plist-get entry :parentId)))
@@ -392,21 +396,19 @@ transcripts just to show picker labels."
       (setq parent-id (plist-get (gethash parent-id by-id) :parentId)))
     parent-id))
 
-(defun pi-session--active-visible-entry-id (entries by-id visible-ids)
-  (let ((current-id (and entries (plist-get (car (last entries)) :id))))
+(defun pi-session--active-visible-entry-id (entries leaf-id by-id visible-ids)
+  (let ((current-id (or leaf-id
+                        (and entries (plist-get (car (last entries)) :id)))))
     (while (and current-id (not (gethash current-id visible-ids)))
       (setq current-id (plist-get (gethash current-id by-id) :parentId)))
     current-id))
 
-(defun pi-session-tree-nodes (session)
-  "Return a flattened representation of SESSION's conversation tree."
-  (let* ((records (pi-session--session-file-records session))
-         (entries (mapcar (lambda (record) (plist-get record :entry))
-                          (seq-remove (lambda (record)
-                                        (equal (plist-get (plist-get record :entry) :type)
-                                               "session"))
-                                      records)))
-         (labels (pi-session--resolved-label-state records))
+(defun pi-session--build-tree-nodes (entries leaf-id)
+  "Return flattened tree nodes for ENTRIES with active LEAF-ID."
+  (let* ((entries (seq-remove (lambda (entry)
+                                (equal (plist-get entry :type) "session"))
+                              entries))
+         (labels (pi-session--resolved-label-state entries))
          (by-id (make-hash-table :test #'equal))
          (visible-ids (make-hash-table :test #'equal))
          (children (make-hash-table :test #'equal))
@@ -418,7 +420,8 @@ transcripts just to show picker labels."
       (puthash (plist-get entry :id) entry by-id)
       (when (pi-session--visible-tree-entry-p entry)
         (puthash (plist-get entry :id) t visible-ids)))
-    (let ((active-id (pi-session--active-visible-entry-id entries by-id visible-ids)))
+    (let ((active-id (pi-session--active-visible-entry-id
+                      entries leaf-id by-id visible-ids)))
       (while active-id
         (puthash active-id t active-path)
         (setq active-id (plist-get (gethash active-id by-id) :parentId))))
@@ -429,7 +432,8 @@ transcripts just to show picker labels."
                (bucket (copy-sequence (gethash parent-id children))))
           (puthash parent-id (append bucket (list entry-id)) children))))
     (setq roots (copy-sequence (gethash nil children)))
-    (let ((current-id (pi-session--active-visible-entry-id entries by-id visible-ids)))
+    (let ((current-id (pi-session--active-visible-entry-id
+                       entries leaf-id by-id visible-ids)))
       (cl-labels
           ((contains-active-p (entry-id)
              (or (gethash entry-id contains-active)
@@ -517,11 +521,11 @@ transcripts just to show picker labels."
 (defun pi-session-navigate-tree (session entry-id callback)
   "Move SESSION to ENTRY-ID and invoke CALLBACK.
 
-Current pi sessions are JSONL trees linked by `id' and `parentId'. RPC mode
-exposes native `fork' and `clone' commands, but not native in-file tree
-navigation yet, so this records a hidden custom leaf marker in the same session
-file. Selecting a user or custom message moves to its parent and returns the
-selected text as `:editor-text', matching current `/tree' behavior."
+As of pi 0.80.6, RPC exposes `fork', `clone', `get_entries', and `get_tree',
+but no native tree-navigation command. Tree reads use RPC; moving the leaf still
+records a hidden custom marker in the session file and restarts the process.
+Selecting a user or custom message moves to its parent and returns its text as
+`:editor-text', matching current `/tree' behavior."
   (condition-case err
       (let* ((records (pi-session--session-file-records session))
              (entry-records (seq-remove (lambda (record)
@@ -588,10 +592,16 @@ selected text as `:editor-text', matching current `/tree' behavior."
                 (list :success :json-false
                       :error (error-message-string err)))))))
 
+(defun pi-session--response-cancelled-p (response)
+  "Return non-nil when successful RESPONSE reports extension cancellation."
+  (and (pi-rpc-success-p response)
+       (pi-rpc-json-truthy-p
+        (plist-get (plist-get response :data) :cancelled))))
+
 (defun pi-session--session-replacement-callback (session response callback)
   "Refresh SESSION state after RESPONSE from a session-replacing command."
   (if (or (not (pi-rpc-success-p response))
-          (pi-rpc-json-truthy-p (plist-get (plist-get response :data) :cancelled)))
+          (pi-session--response-cancelled-p response))
       (when callback
         (funcall callback session response))
     (pi-session--request-state
@@ -764,7 +774,7 @@ The plist keys are :kind, :root, :name, and :key."
          (error-message (plist-get message :errorMessage))
          (state (pi-session-cached-state session)))
     (when (equal role "assistant")
-      (when (member stop-reason '("stop" "length" "error" "aborted"))
+      (when (member stop-reason '("error" "aborted"))
         (setq state (plist-put state :is-streaming nil)))
       (if (and (equal stop-reason "error")
                (stringp error-message)
@@ -799,7 +809,13 @@ The plist keys are :kind, :root, :name, and :key."
      (pi-session--set-streaming session t)
      (setf (pi-session-cached-state session)
            (plist-put (pi-session-cached-state session) :last-error nil)))
-    ("agent_end" (pi-session--set-streaming session nil))
+    ("agent_end" nil)
+    ("agent_settled"
+     (pi-session--set-streaming session nil)
+     (let ((state (pi-session-cached-state session)))
+       (dolist (key '(:is-retrying :retry-attempt :retry-max-attempts))
+         (setq state (plist-put state key nil)))
+       (setf (pi-session-cached-state session) state)))
     ("message_end" (pi-session--apply-assistant-message-end session event))
     ("queue_update" (pi-session--apply-queue-update session event))
     ((or "compaction_start" "compaction_end")
@@ -837,28 +853,11 @@ The plist keys are :kind, :root, :name, and :key."
           :last-refresh-at (float-time))))
 
 (defun pi-session--apply-state (session response)
-  (let* ((data (plist-get response :data))
-         (previous-state (pi-session-cached-state session))
+  (let* ((previous-state (pi-session-cached-state session))
          (state (pi-session--state-from-response response)))
-    (dolist (entry '((:auto-retry-enabled . :autoRetryEnabled)
-                     (:is-retrying . :isRetrying)
-                     (:retry-attempt . :retryAttempt)
-                     (:retry-max-attempts . :retryMaxAttempts)))
-      (let ((state-key (car entry))
-            (data-key (cdr entry)))
-        (setq state
-              (cond
-               ((plist-member data data-key)
-                (plist-put state state-key
-                           (if (memq state-key '(:auto-retry-enabled
-                                                 :is-retrying))
-                               (pi-rpc-json-truthy-p (plist-get data data-key))
-                             (plist-get data data-key))))
-               ((plist-member previous-state state-key)
-                (plist-put state state-key (plist-get previous-state state-key)))
-               (t state)))))
-    (when (plist-member previous-state :last-error)
-      (setq state (plist-put state :last-error (plist-get previous-state :last-error))))
+    (dolist (key pi-session--locally-owned-state-keys)
+      (when (plist-member previous-state key)
+        (setq state (plist-put state key (plist-get previous-state key)))))
     (setf (pi-session-cached-state session) state
           (pi-session-session-file session) (plist-get state :session-file)
           (pi-session-session-id session) (plist-get state :session-id))
@@ -953,6 +952,8 @@ The plist keys are :kind, :root, :name, and :key."
                        session
                        (or (plist-get switch-response :error)
                            "Failed to switch session"))
+                    (when (pi-session--response-cancelled-p switch-response)
+                      (message "pi: session resume cancelled by an extension"))
                     (pi-session--request-state
                      session
                      (lambda (_s _state2 response2)
@@ -1153,6 +1154,34 @@ CALLBACK receives `(SESSION RESPONSE)'."
         (when callback
           (funcall callback session response)))))))
 
+(defun pi-session-get-entries (session callback &optional since)
+  "Load SESSION entries and invoke CALLBACK, optionally starting after SINCE."
+  (pi-session--ensure-running
+   session
+   (lambda (_session)
+     (pi-rpc-send
+      (pi-session-rpc session)
+      (append '(("type" . "get_entries"))
+              (when since `(("since" . ,since))))
+      (lambda (response)
+        (when callback
+          (funcall callback session response)))))))
+
+(defun pi-session-load-tree-nodes (session callback)
+  "Load flattened tree nodes for SESSION and invoke CALLBACK.
+CALLBACK receives `(SESSION NODES ERROR-RESPONSE)'."
+  (pi-session-get-entries
+   session
+   (lambda (s response)
+     (if (not (pi-rpc-success-p response))
+         (funcall callback s nil response)
+       (let ((data (plist-get response :data)))
+         (funcall callback s
+                  (pi-session--build-tree-nodes
+                   (plist-get data :entries)
+                   (plist-get data :leafId))
+                  nil))))))
+
 (defun pi-session-new-session (session &optional callback)
   "Start a fresh session in SESSION scope."
   (pi-session--ensure-running
@@ -1217,15 +1246,21 @@ CALLBACK receives `(SESSION RESPONSE)'."
                        (pi-session--request-state
                         session
                         (lambda (_s2 _state2 response2)
-                          (when (pi-rpc-success-p response2)
+                          (when (and (pi-rpc-success-p response2)
+                                     (not (pi-session--response-cancelled-p
+                                           switch-response)))
                             (pi-session--set-active-file (pi-session-scope-key session)
                                                          session-file))
                           (when callback
                             (funcall callback session
                                      (if (not (pi-rpc-success-p response2))
                                          response2
-                                       (list :success t
-                                             :data (pi-session-cached-state session))))))))))))))))))))
+                                       (if (pi-session--response-cancelled-p
+                                            switch-response)
+                                           (list :success t :data (list :cancelled t))
+                                         (list :success t
+                                               :data (pi-session-cached-state
+                                                      session)))))))))))))))))))))
 
 (defun pi-session-get-available-models (session callback)
   "Load configured models for SESSION and invoke CALLBACK.

@@ -2,20 +2,20 @@
 
 ## Project Goal
 
-Build a writing-first, terminal-free Emacs package for pi.
+Build a terminal-free Emacs package for pi.
 
 Primary use case:
-- stay in the current paper-writing buffer
+- stay in the current editing buffer
 - select a region or use the current paragraph
-- ask pi to revise/rewrite text
-- review the proposed change in Emacs
-- accept or reject without leaving the main writing workflow
+- ask pi to help with the selected text or local context
+- review proposed changes in Emacs
+- accept or reject without leaving the main editing workflow
 
 This project is **not** primarily a chat UI and **not** a terminal wrapper.
 
 ## Product Direction
 
-Treat pi as an async **text rewrite engine** for the current buffer.
+Treat pi as an async **current-buffer assistant** for Emacs.
 
 Primary workflow:
 1. user invokes a command from the current buffer
@@ -24,7 +24,7 @@ Primary workflow:
 4. package shows original vs rewritten text in a review buffer with diff
 5. user accepts or rejects
 
-The current editing buffer is the center of the UX.
+The current editing buffer remains the center of the UX.
 
 ## Strong Requirements
 
@@ -33,7 +33,7 @@ The current editing buffer is the center of the UX.
 - Async operation
 - Review before apply
 - Conservative/safe apply semantics
-- Minimal disruption to paper-writing flow
+- Minimal disruption to the current editing flow
 
 ## Explicit Non-Goals for v1
 
@@ -136,7 +136,7 @@ Avoid open-ended agent tasks for v1.
 
 ## Review UI
 
-The source writing buffer remains primary.
+The source buffer remains primary.
 
 Review should open in a temporary side buffer, not take over the whole workflow.
 
@@ -173,7 +173,7 @@ Do not implement automatic merge logic in v1.
 ## Buffer Model
 
 Visible buffers for v1:
-- the source writing buffer
+- the source buffer
 - a temporary review buffer
 
 Hidden/internal buffers:
@@ -197,12 +197,12 @@ Do not add persistence/session history unless explicitly needed.
 - Prefer a clean, small architecture over feature breadth
 - Keep concerns separated by module
 - Optimize for correctness and low friction
-- Build the writing/review loop first; everything else is secondary
+- Build the current-buffer review loop first; everything else is secondary
 
 ## Design Principle
 
 This project should feel like:
-- “ask pi to revise this text here”
+- “ask pi to help here”
 
 not like:
 - “open a coding-agent terminal/chat app inside Emacs”

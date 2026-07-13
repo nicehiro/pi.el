@@ -113,9 +113,30 @@
                  "150000 -> ~32000 tokens, kept from abcdef12")))
 
 (ert-deftest pi-thinking-level-map-filters-supported-levels ()
-  (let ((model '(:thinkingLevelMap (:off t :minimal :json-false :low t :medium t :high :json-false))))
+  (let ((model '(:reasoning t
+                 :thinkingLevelMap (:off t :minimal :json-false :low t
+                                    :medium t :high :json-false))))
     (should (equal (pi--supported-thinking-levels model)
                    '("off" "low" "medium")))))
+
+(ert-deftest pi-thinking-levels-default-when-map-absent ()
+  (should (equal (pi--supported-thinking-levels '(:reasoning t))
+                 '("off" "minimal" "low" "medium" "high"))))
+
+(ert-deftest pi-thinking-levels-non-reasoning-model ()
+  (dolist (model '((:reasoning :json-false :thinkingLevelMap (:max "max"))
+                   (:reasoning nil :thinkingLevelMap (:xhigh "xhigh"))))
+    (should (equal (pi--supported-thinking-levels model) '("off")))))
+
+(ert-deftest pi-thinking-levels-explicit-xhigh-max ()
+  (should (equal (pi--supported-thinking-levels
+                  '(:reasoning t :thinkingLevelMap (:xhigh "xhigh" :max "max")))
+                 pi-thinking-levels)))
+
+(ert-deftest pi-thinking-levels-null-disables-level ()
+  (should (equal (pi--supported-thinking-levels
+                  '(:reasoning t :thinkingLevelMap (:medium nil)))
+                 '("off" "minimal" "low" "high"))))
 
 (ert-deftest pi-session-source-buffer-prefers-recorded-source ()
   (let ((source (generate-new-buffer " *pi-source-test*"))
@@ -142,15 +163,13 @@
               :isStreaming :json-false
               :isCompacting :json-false
               :autoCompactionEnabled :json-false
-              :autoRetryEnabled :json-false
-              :isRetrying :json-false
               :sessionFile "/tmp/pi-test.jsonl"
               :sessionId "sid")))
     (should-not (plist-get (pi-session-cached-state session) :is-streaming))
     (should-not (plist-get (pi-session-cached-state session) :is-compacting))
     (should-not (plist-get (pi-session-cached-state session) :auto-compaction-enabled))
-    (should-not (plist-get (pi-session-cached-state session) :auto-retry-enabled))
-    (should-not (plist-get (pi-session-cached-state session) :is-retrying))))
+    (should (plist-get (pi-session-cached-state session) :auto-retry-enabled))
+    (should (plist-get (pi-session-cached-state session) :is-retrying))))
 
 (ert-deftest pi-session-apply-state-preserves-absent-local-auto-retry ()
   (let ((session (pi-session--create
@@ -181,6 +200,164 @@
     (should-not (plist-get (pi-session-cached-state session) :is-streaming))
     (should (equal (plist-get (pi-session-cached-state session) :last-error)
                    "stream_read_error"))))
+
+(ert-deftest pi-toggle-auto-retry-defaults-to-enabled ()
+  (let ((session (pi-session--create :id "test-session" :cached-state nil))
+        captured)
+    (cl-letf (((symbol-function 'pi--source-buffer) (lambda () (current-buffer)))
+              ((symbol-function 'pi--ensure-session) (lambda (&rest _) session))
+              ((symbol-function 'pi-session-set-auto-retry)
+               (lambda (_session enabled &optional _callback)
+                 (setq captured enabled))))
+      (pi-toggle-auto-retry))
+    (should-not captured)))
+
+(ert-deftest pi-session-agent-end-keeps-streaming ()
+  (let ((session (pi-session--create
+                  :id "test-session" :cached-state '(:is-streaming t)))
+        (pi-session-event-hook nil))
+    (cl-letf (((symbol-function 'pi-session--touch) #'ignore))
+      (pi-session--event-dispatch session '(:type "agent_end" :willRetry t)))
+    (should (plist-get (pi-session-cached-state session) :is-streaming))))
+
+(ert-deftest pi-session-agent-settled-clears-streaming-and-retry ()
+  (let ((session (pi-session--create
+                  :id "test-session"
+                  :cached-state '(:is-streaming t :is-retrying t
+                                  :retry-attempt 2 :retry-max-attempts 3)))
+        (pi-session-event-hook nil))
+    (cl-letf (((symbol-function 'pi-session--touch) #'ignore))
+      (pi-session--event-dispatch session '(:type "agent_settled")))
+    (let ((state (pi-session-cached-state session)))
+      (should-not (plist-get state :is-streaming))
+      (should-not (plist-get state :is-retrying))
+      (should-not (plist-get state :retry-attempt))
+      (should-not (plist-get state :retry-max-attempts)))))
+
+(ert-deftest pi-session-message-end-stop-keeps-streaming ()
+  (let ((session (pi-session--create
+                  :id "test-session" :cached-state '(:is-streaming t))))
+    (pi-session--apply-assistant-message-end
+     session '(:type "message_end"
+               :message (:role "assistant" :stopReason "stop")))
+    (should (plist-get (pi-session-cached-state session) :is-streaming))))
+
+(ert-deftest pi-session-resume-cancelled-does-not-set-active-file ()
+  (let* ((requested (make-temp-file "pi-requested-" nil ".jsonl"))
+         (actual (make-temp-file "pi-actual-" nil ".jsonl"))
+         (index-file (make-temp-file "pi-index-"))
+         (pi-session-active-index-file index-file)
+         (pi-session--active-index (make-hash-table :test #'equal))
+         (session (pi-session--create
+                   :id "test-session" :scope 'directory :scope-key "scope"
+                   :root default-directory :session-file actual :rpc 'fake-rpc
+                   :status 'ready :cached-state nil))
+         callback-response)
+    (unwind-protect
+        (cl-letf (((symbol-function 'pi-rpc-live-p) (lambda (_rpc) t))
+                  ((symbol-function 'pi-session--touch) #'ignore)
+                  ((symbol-function 'pi-rpc-send)
+                   (lambda (_rpc command callback)
+                     (pcase (cdr (assoc "type" command))
+                       ("get_state"
+                        (funcall callback
+                                 `(:success t :data (:sessionFile ,actual
+                                                :sessionId "actual"))))
+                       ("switch_session"
+                        (funcall callback '(:success t :data (:cancelled t))))))))
+          (pi-session-resume
+           session requested
+           (lambda (_session response) (setq callback-response response))))
+      (delete-file requested)
+      (delete-file actual)
+      (delete-file index-file))
+    (should (plist-get (plist-get callback-response :data) :cancelled))
+    (should (equal (pi-session-session-file session) actual))
+    (should-not (equal (gethash "scope" pi-session--active-index) requested))))
+
+(ert-deftest pi-session-bootstrap-cancelled-switch-marks-ready ()
+  (let* ((requested "/tmp/pi-requested.jsonl")
+         (actual "/tmp/pi-actual.jsonl")
+         (pi-session-active-index-file (make-temp-file "pi-index-"))
+         (pi-session--active-index (make-hash-table :test #'equal))
+         (events nil)
+         (pi-session-event-hook
+          (list (lambda (_session event) (push event events))))
+         (session (pi-session--create
+                   :id "test-session" :scope 'directory :scope-key "scope"
+                   :root default-directory :session-file requested :rpc 'fake-rpc
+                   :status 'starting :cached-state nil)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pi-session--touch) #'ignore)
+                  ((symbol-function 'pi-rpc-send)
+                   (lambda (_rpc command callback)
+                     (pcase (cdr (assoc "type" command))
+                       ("get_state"
+                        (funcall callback
+                                 `(:success t :data (:sessionFile ,actual
+                                                :sessionId "actual"))))
+                       ("switch_session"
+                        (funcall callback '(:success t :data (:cancelled t))))))))
+          (pi-session--bootstrap-after-spawn session))
+      (delete-file pi-session-active-index-file))
+    (should (eq (pi-session-status session) 'ready))
+    (should (equal (pi-session-session-file session) actual))
+    (should-not (seq-some (lambda (event)
+                            (equal (plist-get event :type) "session_error"))
+                          events))))
+
+(defconst pi-test--tree-entries
+  '((:type "message" :id "user-root" :parentId nil :timestamp "1"
+     :message (:role "user" :content ((:type "text" :text "root"))))
+    (:type "message" :id "assistant-root" :parentId "user-root" :timestamp "2"
+     :message (:role "assistant" :content ((:type "text" :text "answer"))))
+    (:type "message" :id "short-leaf" :parentId "assistant-root" :timestamp "3"
+     :message (:role "user" :content ((:type "text" :text "short"))))
+    (:type "label" :id "label-entry" :parentId "short-leaf" :timestamp "4"
+     :targetId "short-leaf" :label "chosen")
+    (:type "message" :id "long-branch" :parentId "assistant-root" :timestamp "5"
+     :message (:role "user" :content ((:type "text" :text "long"))))
+    (:type "message" :id "long-leaf" :parentId "long-branch" :timestamp "6"
+     :message (:role "assistant" :content ((:type "text" :text "later"))))
+    (:type "custom" :id "hidden-mark" :parentId "long-leaf" :timestamp "7"
+     :customType "pi.el/tree"))
+  "Synthetic branching session entries for tree tests.")
+
+(ert-deftest pi-session-tree-builder-marks-leaf-active ()
+  (let* ((nodes (pi-session--build-tree-nodes pi-test--tree-entries "short-leaf"))
+         (current (seq-find (lambda (node) (plist-get node :current)) nodes)))
+    (should (equal (plist-get current :id) "short-leaf"))))
+
+(ert-deftest pi-session-tree-builder-hides-custom-and-label-entries ()
+  (let ((nodes (pi-session--build-tree-nodes pi-test--tree-entries "short-leaf")))
+    (should-not (seq-find (lambda (node)
+                           (member (plist-get node :id)
+                                   '("label-entry" "hidden-mark")))
+                         nodes))
+    (should (string-match-p
+             "\\[chosen\\]"
+             (plist-get (seq-find (lambda (node)
+                                    (equal (plist-get node :id) "short-leaf"))
+                                  nodes)
+                        :display)))))
+
+(ert-deftest pi-session-tree-builder-falls-back-without-leaf ()
+  (let* ((nodes (pi-session--build-tree-nodes pi-test--tree-entries nil))
+         (current (seq-find (lambda (node) (plist-get node :current)) nodes)))
+    (should (equal (plist-get current :id) "long-leaf"))))
+
+(ert-deftest pi-session-get-entries-adds-optional-cursor ()
+  (let ((session (pi-session--create
+                  :id "test-session" :status 'ready :rpc 'fake-rpc))
+        sent)
+    (cl-letf (((symbol-function 'pi-rpc-live-p) (lambda (_rpc) t))
+              ((symbol-function 'pi-session--touch) #'ignore)
+              ((symbol-function 'pi-rpc-send)
+               (lambda (_rpc command callback)
+                 (setq sent command)
+                 (funcall callback '(:success t :data (:entries nil :leafId nil))))))
+      (pi-session-get-entries session #'ignore "cursor-1"))
+    (should (equal sent '(("type" . "get_entries") ("since" . "cursor-1"))))))
 
 (ert-deftest pi-session-send-prompt-refreshes-state-before-prompt ()
   (let* ((sent-commands nil)

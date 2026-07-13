@@ -8,7 +8,7 @@ It starts hidden `pi --mode rpc` subprocesses, keeps one session per project or 
 
 ## Status
 
-Early and evolving. This package targets `@earendil-works/pi-coding-agent` 0.80.0 or newer and intentionally follows the current RPC protocol without compatibility shims for older pi releases.
+Early and evolving. This package targets `@earendil-works/pi-coding-agent` 0.80.4 or newer and intentionally follows the current RPC protocol without compatibility shims for older pi releases.
 
 Pi RPC mode follows pi's project-trust rules. If you want Emacs sessions to load project-local `.pi` settings, extensions, skills, prompts, or themes, trust the project from interactive pi first, configure pi's `defaultProjectTrust`, or add `--approve` to `pi-rpc-extra-args`.
 

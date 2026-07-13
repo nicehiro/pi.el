@@ -29,7 +29,7 @@
 (declare-function pi-session-new-session "pi-session" (session &optional callback))
 (declare-function pi-session-resume "pi-session" (session session-file &optional callback))
 (declare-function pi-session-saved-sessions-for-buffer "pi-session" (&optional buffer))
-(declare-function pi-session-tree-nodes "pi-session" (session))
+(declare-function pi-session-load-tree-nodes "pi-session" (session callback))
 (declare-function pi-session-navigate-tree "pi-session" (session entry-id callback))
 (declare-function pi-session-get-fork-messages "pi-session" (session callback))
 (declare-function pi-session-fork "pi-session" (session entry-id &optional callback))
@@ -43,6 +43,7 @@
 (declare-function pi-session-abort-retry "pi-session" (session &optional callback))
 (declare-function pi-session-get-session-stats "pi-session" (session callback))
 (declare-function pi-session-get-state "pi-session" (session callback))
+(declare-function pi-session-get-commands "pi-session" (session callback))
 (declare-function pi-session-get-last-assistant-text "pi-session" (session callback))
 (declare-function pi-session-export-html "pi-session" (session &optional output-path callback))
 (declare-function pi-session-set-model "pi-session" (session provider model-id &optional callback))
@@ -60,7 +61,7 @@
   :group 'applications)
 
 (defconst pi-thinking-levels
-  '("off" "minimal" "low" "medium" "high" "xhigh")
+  '("off" "minimal" "low" "medium" "high" "xhigh" "max")
   "Display order for pi thinking levels.")
 
 (defconst pi-queue-modes '("all" "one-at-a-time")
@@ -68,12 +69,17 @@
 
 (defun pi--thinking-level-supported-p (model level)
   "Return non-nil when MODEL supports thinking LEVEL."
-  (let* ((level-map (plist-get model :thinkingLevelMap))
-         (key (intern (concat ":" level)))
-         (value (and (listp level-map)
-                     (plist-member level-map key)
-                     (plist-get level-map key))))
-    (and value (not (eq value :json-false)))))
+  (if (not (pi-rpc-json-truthy-p (plist-get model :reasoning)))
+      (equal level "off")
+    (let* ((level-map (plist-get model :thinkingLevelMap))
+           (key (intern (concat ":" level)))
+           (present (and (listp level-map) (plist-member level-map key)))
+           (value (and present (plist-get level-map key))))
+      (cond
+       ((and present (or (null value) (eq value :json-false))) nil)
+       ((member level '("xhigh" "max"))
+        (and present (pi-rpc-json-truthy-p value)))
+       (t t)))))
 
 (defun pi--supported-thinking-levels (model)
   "Return current pi thinking levels supported by MODEL."
@@ -98,6 +104,8 @@
     (define-key map (kbd "e") #'pi-export-session-html)
     (define-key map (kbd "i") #'pi-status)
     (define-key map (kbd "j") #'pi-tree)
+    (define-key map (kbd "/") #'pi-command)
+    (define-key map (kbd "x") #'pi-extension-command)
     (define-key map (kbd "m") #'pi-cycle-model)
     (define-key map (kbd "s") #'pi-set-model)
     (define-key map (kbd "t") #'pi-cycle-thinking-level)
@@ -209,43 +217,51 @@ directory scope has no existing pi session, signal a user error."
   "Open a picker for the current session tree and switch to the selected point."
   (interactive)
   (let* ((source-buffer (pi--tree-source-buffer))
-         (session (pi--existing-session-for-tree source-buffer))
-         (nodes (pi-session-tree-nodes session)))
-    (unless nodes
-      (user-error "pi: current session tree is empty"))
-    (let* ((choices (mapcar (lambda (node)
-                              (cons (plist-get node :display) node))
-                            nodes))
-           (default-choice (car (seq-find (lambda (choice)
-                                            (plist-get (cdr choice) :current))
-                                          choices)))
-           (selection (let ((completion-extra-properties
-                             '(:display-sort-function identity
-                               :cycle-sort-function identity)))
-                        (completing-read "Session tree: "
-                                         (mapcar #'car choices)
-                                         nil t nil nil default-choice)))
-           (node (cdr (assoc selection choices))))
-      (when node
-        (if (and (plist-get node :current)
-                 (not (pi--tree-node-reeditable-p node)))
-            (message "pi: already at this point")
-          (pi-session-navigate-tree
-           session
-           (plist-get node :id)
-           (lambda (s response)
-             (if (pi--rpc-success-p response)
-                 (let ((editor-text (plist-get (plist-get response :data) :editor-text)))
-                   (pi-ui-show-session-buffer s source-buffer)
-                   (if (and (stringp editor-text)
-                            (not (string-empty-p editor-text)))
-                       (progn
-                         (message "pi: rewound session; edit the prompt to continue")
-                         (pi-ui-compose-prompt source-buffer editor-text))
-                     (message "pi: moved to selected tree entry")))
-               (message "pi: %s"
-                        (or (plist-get response :error)
-                            "Failed to switch to the selected tree entry"))))))))))
+         (session (pi--existing-session-for-tree source-buffer)))
+    (pi-session-load-tree-nodes
+     session
+     (lambda (_s nodes error-response)
+       (if error-response
+           (message "pi: %s" (or (plist-get error-response :error)
+                                  "Failed to load session tree"))
+         (if (null nodes)
+             (message "pi: current session tree is empty")
+           (let* ((choices (mapcar (lambda (node)
+                                     (cons (plist-get node :display) node))
+                                   nodes))
+                  (default-choice
+                   (car (seq-find (lambda (choice)
+                                    (plist-get (cdr choice) :current))
+                                  choices)))
+                  (selection
+                   (let ((completion-extra-properties
+                          '(:display-sort-function identity
+                            :cycle-sort-function identity)))
+                     (completing-read "Session tree: "
+                                      (mapcar #'car choices)
+                                      nil t nil nil default-choice)))
+                  (node (cdr (assoc selection choices))))
+             (when node
+               (if (and (plist-get node :current)
+                        (not (pi--tree-node-reeditable-p node)))
+                   (message "pi: already at this point")
+                 (pi-session-navigate-tree
+                  session
+                  (plist-get node :id)
+                  (lambda (s response)
+                    (if (pi--rpc-success-p response)
+                        (let ((editor-text
+                               (plist-get (plist-get response :data) :editor-text)))
+                          (pi-ui-show-session-buffer s source-buffer)
+                          (if (and (stringp editor-text)
+                                   (not (string-empty-p editor-text)))
+                              (progn
+                                (message "pi: rewound session; edit the prompt to continue")
+                                (pi-ui-compose-prompt source-buffer editor-text))
+                            (message "pi: moved to selected tree entry")))
+                      (message "pi: %s"
+                               (or (plist-get response :error)
+                                   "Failed to switch to the selected tree entry"))))))))))))))
 
 (defun pi-prompt ()
   "Compose and send a prompt to the current buffer scope session."
@@ -305,7 +321,9 @@ directory scope has no existing pi session, signal a user error."
          session session-file
          (lambda (s response)
            (if (pi--rpc-success-p response)
-               (progn
+               (if (pi-rpc-json-truthy-p
+                    (plist-get (plist-get response :data) :cancelled))
+                   (message "pi: resume cancelled")
                  (pi-ui-show-session-buffer s source-buffer)
                  (message "pi: resumed session"))
              (message "pi: %s"
@@ -471,13 +489,15 @@ With optional INSTRUCTIONS, pass custom compaction guidance."
                                "Failed to set follow-up mode")))))))
 
 (defun pi-set-auto-retry (enabled)
-  "Enable or disable automatic retry for the current session."
+  "Enable or disable automatic retry for the current session.
+Pi does not expose this setting in state, so its cached value is client-owned."
   (interactive
    (let* ((source-buffer (pi--source-buffer))
           (session (pi--ensure-session source-buffer))
-          (current (pi-rpc-json-truthy-p
-                    (plist-get (pi-session-cached-state session)
-                               :auto-retry-enabled))))
+          (state (pi-session-cached-state session))
+          (current (if (plist-member state :auto-retry-enabled)
+                       (pi-rpc-json-truthy-p (plist-get state :auto-retry-enabled))
+                     t)))
      (list (y-or-n-p (format "Enable auto-retry? (currently %s) "
                              (if current "enabled" "disabled"))))))
   (let* ((source-buffer (pi--source-buffer))
@@ -491,13 +511,16 @@ With optional INSTRUCTIONS, pass custom compaction guidance."
                                "Failed to update auto-retry")))))))
 
 (defun pi-toggle-auto-retry ()
-  "Toggle automatic retry for the current session."
+  "Toggle automatic retry for the current session.
+When uncached, assume pi's default setting is enabled."
   (interactive)
   (let* ((source-buffer (pi--source-buffer))
          (session (pi--ensure-session source-buffer))
-         (enabled (not (pi-rpc-json-truthy-p
-                        (plist-get (pi-session-cached-state session)
-                                   :auto-retry-enabled)))))
+         (state (pi-session-cached-state session))
+         (current (if (plist-member state :auto-retry-enabled)
+                      (pi-rpc-json-truthy-p (plist-get state :auto-retry-enabled))
+                    t))
+         (enabled (not current)))
     (pi-session-set-auto-retry
      session enabled
      (lambda (_s response)
@@ -727,8 +750,8 @@ If PATH is empty, let pi choose the output path."
          (model (plist-get state :model))
          (levels (pi--supported-thinking-levels model))
          (current (plist-get state :thinking-level)))
-    (unless levels
-      (user-error "pi: current model does not expose configurable thinking levels"))
+    (when (equal levels '("off"))
+      (user-error "pi: current model does not support thinking"))
     (completing-read
      (if current
          (format "Thinking level (current %s): " current)
@@ -751,6 +774,89 @@ If PATH is empty, let pi choose the output path."
            (message "pi: set thinking level to %s" level)
          (message "pi: %s" (or (plist-get response :error)
                                "Failed to set thinking level")))))))
+
+(defun pi--command-source (command)
+  "Return the source string for COMMAND."
+  (or (plist-get command :source)
+      (when-let* ((source-info (plist-get command :sourceInfo)))
+        (plist-get source-info :source))
+      "command"))
+
+(defun pi--command-description (command)
+  "Return a concise description for COMMAND."
+  (or (plist-get command :description)
+      (let ((path (or (plist-get command :path)
+                      (when-let* ((source-info (plist-get command :sourceInfo)))
+                        (plist-get source-info :path)))))
+        (and path (file-name-nondirectory path)))
+      ""))
+
+(defun pi--command-label (command)
+  "Return a completion label for COMMAND."
+  (let* ((name (plist-get command :name))
+         (source (pi--command-source command))
+         (description (pi--command-description command)))
+    (string-trim
+     (format "/%s [%s]%s"
+             name source
+             (if (string-empty-p description)
+                 ""
+               (format " — %s" description))))))
+
+(defun pi--run-command-from-list (session source-buffer commands prompt)
+  "Read one of COMMANDS with PROMPT and send it through SESSION."
+  (let* ((choices (mapcar (lambda (command)
+                            (cons (pi--command-label command) command))
+                          commands))
+         (selection (completing-read prompt (mapcar #'car choices) nil t))
+         (command (cdr (assoc selection choices)))
+         (name (plist-get command :name))
+         (args (read-string (format "/%s arguments (optional): " name)))
+         (message (if (string-empty-p (string-trim args))
+                      (format "/%s" name)
+                    (format "/%s %s" name args))))
+    (pi-session-send-prompt
+     session message
+     (lambda (_s response)
+       (if (pi--rpc-success-p response)
+           (progn
+             (pi-ui-show-session-buffer session source-buffer)
+             (message "pi: sent %s" (format "/%s" name)))
+         (message "pi: %s" (or (plist-get response :error)
+                               "Failed to run command")))))))
+
+(defun pi-command (&optional extension-only)
+  "Run a pi slash command discovered through RPC.
+With EXTENSION-ONLY, show only extension commands."
+  (interactive "P")
+  (let* ((source-buffer (pi--source-buffer))
+         (session (pi--ensure-session source-buffer)))
+    (pi-session-get-commands
+     session
+     (lambda (s response)
+       (if (not (pi--rpc-success-p response))
+           (message "pi: %s" (or (plist-get response :error)
+                                 "Failed to load commands"))
+         (let* ((all-commands (plist-get (plist-get response :data) :commands))
+                (commands (if extension-only
+                              (seq-filter (lambda (command)
+                                            (equal (pi--command-source command)
+                                                   "extension"))
+                                          all-commands)
+                            all-commands)))
+           (if (null commands)
+               (message "pi: no %scommands available"
+                        (if extension-only "extension " ""))
+             (pi--run-command-from-list
+              s source-buffer commands
+              (if extension-only
+                  "Pi extension command: "
+                "Pi command: ")))))))))
+
+(defun pi-extension-command ()
+  "Run a pi extension slash command discovered through RPC."
+  (interactive)
+  (pi-command t))
 
 (defun pi-reload-session ()
   "Restart the current scope session process."

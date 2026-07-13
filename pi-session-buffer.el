@@ -629,6 +629,9 @@ Show or create the session buffer, but keep focus in SOURCE-BUFFER window."
            (pi-ui--append-transient buffer (list :kind 'error :text text))))
         ("agent_end"
          (pi-ui--update-session-header-line buffer)
+         (pi-ui--refresh-session-state-and-render session buffer))
+        ("agent_settled"
+         (pi-ui--update-session-header-line buffer)
          (pi-ui--refresh-session-state-and-render
           session buffer
           (lambda ()
